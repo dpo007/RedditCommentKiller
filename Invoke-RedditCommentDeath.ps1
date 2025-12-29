@@ -588,13 +588,6 @@ function Invoke-RedditApi {
                 continue
             }
 
-            # 403: permission/locked/forbidden; do not retry
-            if ($status -eq 403) {
-                $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
-                Write-Warning "API call returned 403 Forbidden$ctx for $Method $Uri; not retrying."
-                throw
-            }
-
             # Retry policy
             $shouldRetry = $false
 
