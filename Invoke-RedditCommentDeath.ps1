@@ -432,7 +432,10 @@ function Invoke-RedditApi {
 
         # Prepare request parameters; ResponseHeadersVariable captures rate-limit headers
         $params = @{ Method = $Method; Uri = $Uri; Headers = $headers; ErrorAction = 'Stop'; ResponseHeadersVariable = 'respHeaders' }
-        if ($Body) { $params.Body = $Body }
+        if ($Body) {
+            $params.Body = $Body
+            $params.ContentType = 'application/x-www-form-urlencoded'
+        }
 
         # Build query string with proper URL encoding if query parameters provided
         if ($Query) {
