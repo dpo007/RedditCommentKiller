@@ -677,7 +677,7 @@ function Initialize-ProcessedLog {
     }
 }
 
-function Load-ProcessedLog {
+function Import-ProcessedLog {
     <#
     .SYNOPSIS
     Loads processed IDs from the append-only log into a HashSet.
@@ -696,7 +696,7 @@ function Load-ProcessedLog {
     }
 }
 
-function Append-ProcessedIds {
+function Add-ProcessedIds {
     <#
     .SYNOPSIS
     Appends one or more processed IDs to the processed-id log efficiently.
@@ -779,7 +779,7 @@ $state = Import-Checkpoint
 Initialize-ProcessedLog
 
 $processedSet = [System.Collections.Generic.HashSet[string]]::new()
-Load-ProcessedLog -Set $processedSet
+Import-ProcessedLog -Set $processedSet
 
 # Migrate any legacy `processed` ids stored in the checkpoint into the append-only log (Option B)
 if ($state.processed -and $state.processed.Count -gt 0) {
@@ -794,7 +794,7 @@ if ($state.processed -and $state.processed.Count -gt 0) {
     }
 
     if ($toAppend.Count -gt 0) {
-        Append-ProcessedIds -Ids $toAppend.ToArray()
+        Add-ProcessedIds -Ids $toAppend.ToArray()
         Write-Host "Migrated $($toAppend.Count) legacy processed IDs into $ProcessedLogPath" -ForegroundColor Yellow
     }
 }
@@ -865,13 +865,13 @@ while ($true) {
         # Skip if already processed in previous run (resume functionality)
         if ($processedSet.Contains($fullname)) { continue }
 
-        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
-
         $summary.matched++
         $actionDesc = "comment $fullname"
 
         # Honor -WhatIf parameter (CmdletBinding SupportsShouldProcess)
         if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) { continue }
+
+        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
 
         # Initialize tracking variables for this comment's processing
         $overwriteText = $null
@@ -982,7 +982,7 @@ while ($true) {
 
         # Mark as processed to avoid reprocessing on resume
         if ($processedSet.Add($fullname)) {
-            Append-ProcessedIds -Ids @($fullname)
+            Add-ProcessedIds -Ids @($fullname)
         }
         $batchCount++
 
