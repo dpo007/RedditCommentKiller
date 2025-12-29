@@ -297,7 +297,7 @@ function Get-AccessToken {
     $resp = Invoke-RestMethod -Method Post -Uri 'https://www.reddit.com/api/v1/access_token' -Headers $headers -Body $body -ErrorAction Stop
 
     # Calculate expiration time with 30-second buffer to ensure we refresh before actual expiry
-    $expiresAt = (Get-Date).AddSeconds([int]$resp.expires_in - 30)
+    $expiresAt = (Get-Date).ToUniversalTime().AddSeconds([int]$resp.expires_in - 30)
 
     # Cache token information at script scope for reuse
     $Script:TokenInfo = [PSCustomObject]@{
@@ -314,7 +314,7 @@ function Confirm-AccessToken {
     Ensures a valid access token exists, refreshing if expired or missing.
     #>
     # Check if token is missing or expired; if so, obtain a new one
-    if (-not $Script:TokenInfo -or (Get-Date) -gt $Script:TokenInfo.ExpiresAt) {
+    if (-not $Script:TokenInfo -or (Get-Date).ToUniversalTime() -gt $Script:TokenInfo.ExpiresAt) {
         Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -UserAgent $UserAgent
     }
 }
