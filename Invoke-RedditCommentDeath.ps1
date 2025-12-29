@@ -32,6 +32,12 @@ Controls overwrite text selection: RotatePhrases, RandomJunk, or FixedText.
 .PARAMETER FixedOverwriteText
 Text used when OverwriteMode is FixedText.
 
+.PARAMETER TwoPassProbability
+Probability (0..1) that a given comment will use a two-pass overwrite (edit A -> wait -> edit B -> wait -> delete). Selection is stable per comment based on fullname and a local salt.
+
+.PARAMETER TwoPassSaltPath
+Path to a local salt file used to make two-pass selection stable across runs. If not provided, it is derived from ResumePath using the same base name.
+
 .PARAMETER EditDelaySecondsMin
 Minimum seconds to wait between edit and delete of a single comment.
 
@@ -96,12 +102,29 @@ param(
     [ValidateRange(1, 5000)]
     [int]$DaysOld,
 
+    [ValidateRange(0, 720)]
+    [int]$SafetyHours = 0,
+
     [switch]$SkipOverwrite,
+
+    [switch]$EnableMostlyProcessedStop,
+
+    [ValidateRange(1, 100)]
+    [int]$MostlyProcessedConsecutivePages = 3,
+
+    [ValidateRange(0.0, 1.0)]
+    [double]$MostlyProcessedRatioThreshold = 0.02,
+
+    [ValidateRange(0, 1000)]
+    [int]$MostlyProcessedMaxUnprocessedPerPage = 2,
 
     [ValidateSet('RotatePhrases', 'RandomJunk', 'FixedText')]
     [string]$OverwriteMode = 'RotatePhrases',
 
     [string]$FixedOverwriteText = '[deleted]',
+
+    [ValidateRange(0.0, 1.0)]
+    [double]$TwoPassProbability = 0.0,
 
     [ValidateRange(1, 86400)]
     [int]$EditDelaySecondsMin = 10,
@@ -124,6 +147,8 @@ param(
     [string]$ResumePath = './reddit_cleanup_state.json',
 
     [string]$ProcessedLogPath,
+
+    [string]$TwoPassSaltPath,
 
     [string]$ReportPath = './reddit_cleanup_report.csv',
 
@@ -149,6 +174,16 @@ if ([string]::IsNullOrWhiteSpace($ProcessedLogPath)) {
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($resumeLeaf)
     if ([string]::IsNullOrWhiteSpace($resumeDir)) { $resumeDir = '.' }
     $ProcessedLogPath = Join-Path -Path $resumeDir -ChildPath ("$baseName.processed_ids.log")
+}
+
+# Derive two-pass salt path from ResumePath unless explicitly provided.
+# Example: ./reddit_cleanup_state.json -> ./reddit_cleanup_state.two_pass_salt.txt
+if ([string]::IsNullOrWhiteSpace($TwoPassSaltPath)) {
+    $resumeDir = Split-Path -Parent $ResumePath
+    $resumeLeaf = Split-Path -Leaf $ResumePath
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($resumeLeaf)
+    if ([string]::IsNullOrWhiteSpace($resumeDir)) { $resumeDir = '.' }
+    $TwoPassSaltPath = Join-Path -Path $resumeDir -ChildPath ("$baseName.two_pass_salt.txt")
 }
 
 # Auto-generate UserAgent if not provided (Reddit API requirement)
@@ -177,6 +212,53 @@ function ConvertFrom-SecureStringPlain {
         # Always zero and free unmanaged memory for security
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
     }
+}
+
+function Get-OrCreateTwoPassSalt {
+    <#
+    .SYNOPSIS
+    Loads a stable local salt for two-pass selection, creating it if missing.
+    #>
+    if (Test-Path $TwoPassSaltPath) {
+        $existing = (Get-Content -Path $TwoPassSaltPath -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not [string]::IsNullOrWhiteSpace($existing)) { return ([string]$existing).Trim() }
+    }
+
+    $dir = Split-Path -Parent $TwoPassSaltPath
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $bytes = [byte[]]::new(16)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $salt = [Convert]::ToBase64String($bytes)
+    $salt | Set-Content -Path $TwoPassSaltPath -Encoding UTF8
+    return $salt
+}
+
+function Get-StableProbability {
+    <#
+    .SYNOPSIS
+    Returns a deterministic pseudo-random value in [0,1) based on Id + Salt.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Salt
+    )
+
+    $input = "$Id|$Salt"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($input)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    $u = [System.BitConverter]::ToUInt64($hash, 0)
+    return ([double]$u / ([double][UInt64]::MaxValue + 1.0))
 }
 
 # Script-level variable to store OAuth token and expiration time
@@ -316,6 +398,7 @@ function Invoke-RedditApi {
         [hashtable]$Body,
         [hashtable]$Query,
         [switch]$IsWrite,
+        [switch]$ExpectJson = $true,
         [string]$Context
     )
 
@@ -373,9 +456,34 @@ function Invoke-RedditApi {
             # Execute the HTTP request
             $resp = Invoke-WebRequest @params
             $content = $null
+            $rawContent = $resp.Content
+            $parseError = $null
 
-            # Parse JSON response if content exists
-            if ($resp.Content) { $content = $resp.Content | ConvertFrom-Json -ErrorAction SilentlyContinue }
+            if ($rawContent) {
+                if ($ExpectJson) {
+                    try {
+                        $content = $rawContent | ConvertFrom-Json -ErrorAction Stop
+                    }
+                    catch {
+                        $parseError = $_
+                    }
+
+                    $hasBody = -not [string]::IsNullOrWhiteSpace([string]$rawContent)
+                    if (($parseError -or ($null -eq $content -and $hasBody))) {
+                        $snippetLength = [Math]::Min([int]$rawContent.Length, 500)
+                        $snippet = $rawContent.Substring(0, $snippetLength)
+                        $snippet = $snippet -replace "`r", '' -replace "`n", ' '
+                        $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
+                        $statusLabel = $resp.StatusCode
+                        $errMsg = $parseError ? $parseError.Exception.Message : 'Content was not JSON.'
+                        throw "Expected JSON response$ctx for $Method $Uri but parsing failed (status $statusLabel). $errMsg Snippet: $snippet"
+                    }
+                }
+                else {
+                    $content = $rawContent | ConvertFrom-Json -ErrorAction SilentlyContinue
+                }
+            }
+
             if ($VerboseLogging) { Write-Verbose "API $Method $Uri status $($resp.StatusCode) attempt $attempt" }
 
             # Check Reddit's documented rate-limit headers (treat as authoritative when present)
@@ -665,6 +773,9 @@ function Add-ReportRow {
 # Using UTC end-to-end prevents timezone/DST boundary misclassification.
 $cutoffUtc = (Get-Date).ToUniversalTime().AddDays(-1 * $DaysOld)
 
+# Optional safety margin shifts the effective cutoff older to guard against clock/math mistakes
+$effectiveCutoffUtc = $cutoffUtc.AddHours(-1 * $SafetyHours)
+
 # Load checkpoint to resume from previous run if interrupted
 $state = Import-Checkpoint
 
@@ -692,18 +803,30 @@ if ($state.processed -and $state.processed.Count -gt 0) {
     }
 }
 
+# Two-pass overwrite selection uses a stable local salt.
+$twoPassSalt = $null
+if ($TwoPassProbability -gt 0) {
+    $twoPassSalt = Get-OrCreateTwoPassSalt
+}
+
 # Ensure CSV report exists with headers
 Initialize-Report
 
 # Track processing statistics for final summary
 $summary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
 $batchCount = 0
+$consecutiveMostlyProcessedPages = 0
 
 # Resume from saved pagination token if available
 $after = $state.after
 $pastCutoffZone = $false
 
-Write-Host "Scanning comments older than $DaysOld days (cutoff UTC $($cutoffUtc.ToString('u')))" -ForegroundColor Cyan
+if ($SafetyHours -gt 0) {
+    Write-Host "Scanning comments older than $DaysOld days with safety margin $SafetyHours h (effective cutoff UTC $($effectiveCutoffUtc.ToString('u')); raw cutoff $($cutoffUtc.ToString('u')))" -ForegroundColor Cyan
+}
+else {
+    Write-Host "Scanning comments older than $DaysOld days (cutoff UTC $($effectiveCutoffUtc.ToString('u')))" -ForegroundColor Cyan
+}
 
 # Main pagination loop: iterate through all comment pages
 while ($true) {
@@ -716,6 +839,9 @@ while ($true) {
 
     $children = $data.data.children
     if (-not $children) { break }
+
+    $pageOlderTotal = 0
+    $pageOlderUnprocessed = 0
 
     # Process each comment in the current page
     foreach ($child in $children) {
@@ -732,13 +858,18 @@ while ($true) {
 
         # Listing is newest -> oldest. Skip newer-than-cutoff and keep paging until end.
         if (-not $pastCutoffZone) {
-            if ($createdUtc -gt $cutoffUtc) { continue }
+            if ($createdUtc -gt $effectiveCutoffUtc) { continue }
             # We have reached the cutoff zone; all remaining items are older.
             $pastCutoffZone = $true
         }
 
+        # Once past the cutoff, track per-page older-item stats for stop-optimizations
+        if ($pastCutoffZone) { $pageOlderTotal++ }
+
         # Skip if already processed in previous run (resume functionality)
         if ($processedSet.Contains($fullname)) { continue }
+
+        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
 
         $summary.matched++
         $actionDesc = "comment $fullname"
@@ -753,6 +884,13 @@ while ($true) {
         $errorMessage = ''
         $didWrite = $false  # Track if we performed a write operation
 
+        # Stable-random selection for two-pass overwrite (deterministic across re-runs for you; unpredictable to outsiders)
+        $doTwoPass = $false
+        if ($OverwriteEnabled -and $TwoPassProbability -gt 0 -and $twoPassSalt) {
+            $p = Get-StableProbability -Id $fullname -Salt $twoPassSalt
+            if ($p -lt $TwoPassProbability) { $doTwoPass = $true }
+        }
+
         # Overwrite phase: replace comment content for privacy before deletion (unless -SkipOverwrite)
         if ($OverwriteEnabled) {
             $overwriteText = Get-OverwriteText -Mode $OverwriteMode
@@ -762,9 +900,9 @@ while ($true) {
                 try {
                     # Reddit's editusertext endpoint requires thing_id and new text
                     $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -Context $fullname
+                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -ExpectJson:$false -Context $fullname
                     $summary.edited++
-                    $editStatus = 'edited'
+                    $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                 }
                 catch {
                     # Continue to delete even if edit fails (e.g., archived/locked comments)
@@ -775,12 +913,38 @@ while ($true) {
             }
             else {
                 # Dry-run mode: simulate without actual API calls
-                $editStatus = 'dry-run'
+                $editStatus = $doTwoPass ? 'dry-run(1/2)' : 'dry-run'
             }
 
-            # Randomized delay between edit and delete to appear more human
+            # Randomized delay between overwrite passes / before delete to appear more human
             $sleep = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
             if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
+
+            # Optional second overwrite pass for a stable-random subset of comments
+            if ($doTwoPass) {
+                $overwriteText2 = Get-OverwriteText -Mode $OverwriteMode
+
+                if (-not $DryRun) {
+                    try {
+                        $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
+                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -ExpectJson:$false -Context $fullname
+                        $summary.edited++
+                        $editStatus = 'edited(2/2)'
+                    }
+                    catch {
+                        $errorMessage = ($errorMessage ? ($errorMessage + ' | ') : '') + "Second edit failed: $($_.Exception.Message)"
+                        Write-Warning "$fullname second edit failed: $($_.Exception.Message)"
+                        $summary.failures++
+                        $editStatus = 'edited(1/2)+fail(2/2)'
+                    }
+                }
+                else {
+                    $editStatus = 'dry-run(2/2)'
+                }
+
+                $sleep2 = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
+                if ($sleep2 -gt 0) { Start-Sleep -Seconds $sleep2 }
+            }
         }
 
         # Deletion phase: remove comment from Reddit
@@ -788,7 +952,7 @@ while ($true) {
             try {
                 # Reddit's del endpoint requires the thing's full name
                 $body = @{ id = $fullname }
-                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -Context $fullname
+                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -ExpectJson:$false -Context $fullname
                 $summary.deleted++
                 $deleteStatus = 'deleted'
             }
@@ -809,7 +973,7 @@ while ($true) {
                 permalink   = $permalink
                 subreddit   = $subreddit
                 fullname    = $fullname
-                action      = $OverwriteEnabled ? 'edit+delete' : 'delete'
+            action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
                 status      = "$editStatus/$deleteStatus"
                 error       = $errorMessage
             })
@@ -839,8 +1003,39 @@ while ($true) {
     # Extract next page token from Reddit's response for pagination
     $after = $data.data.after
 
+    $stopPaging = $false
+    if ($pastCutoffZone -and $pageOlderTotal -gt 0) {
+        if ($pageOlderUnprocessed -eq 0) {
+            $stopPaging = $true
+            if ($VerboseLogging) { Write-Verbose "Stopping: past cutoff and page older items already processed (total=$pageOlderTotal)." }
+        }
+        elseif ($EnableMostlyProcessedStop) {
+            $ratio = $pageOlderUnprocessed / [double]$pageOlderTotal
+            if ($pageOlderUnprocessed -le $MostlyProcessedMaxUnprocessedPerPage -and $ratio -le $MostlyProcessedRatioThreshold) {
+                $consecutiveMostlyProcessedPages++
+                if ($VerboseLogging) {
+                    Write-Verbose ("Mostly-processed page {0}/{1} (older total={2}, unprocessed={3}, ratio={4:P2})" -f $consecutiveMostlyProcessedPages, $MostlyProcessedConsecutivePages, $pageOlderTotal, $pageOlderUnprocessed, $ratio)
+                }
+                if ($consecutiveMostlyProcessedPages -ge $MostlyProcessedConsecutivePages) {
+                    $stopPaging = $true
+                }
+            }
+            else {
+                $consecutiveMostlyProcessedPages = 0
+            }
+        }
+        else {
+            $consecutiveMostlyProcessedPages = 0
+        }
+    }
+    else {
+        $consecutiveMostlyProcessedPages = 0
+    }
+
     # Save checkpoint at page boundary using next-page cursor
     Save-Checkpoint -State ([PSCustomObject]@{ after = $after })
+
+    if ($stopPaging) { break }
 
     # If no 'after' token, we've reached the end of the listing
     if (-not $after) { break }
