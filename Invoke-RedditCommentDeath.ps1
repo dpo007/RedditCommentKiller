@@ -247,8 +247,8 @@ function Get-StableProbability {
         [string]$Salt
     )
 
-    $input = "$Id|$Salt"
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($input)
+    $hashInput = "$Id|$Salt"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($hashInput)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $hash = $sha.ComputeHash($bytes)
@@ -398,7 +398,7 @@ function Invoke-RedditApi {
         [hashtable]$Body,
         [hashtable]$Query,
         [switch]$IsWrite,
-        [switch]$ExpectJson = $true,
+        [switch]$AllowNonJsonResponse,
         [string]$Context
     )
 
@@ -463,7 +463,7 @@ function Invoke-RedditApi {
             $parseError = $null
 
             if ($rawContent) {
-                if ($ExpectJson) {
+                if (-not $AllowNonJsonResponse) {
                     try {
                         $content = $rawContent | ConvertFrom-Json -ErrorAction Stop
                     }
@@ -896,7 +896,7 @@ while ($true) {
                 try {
                     # Reddit's editusertext endpoint requires thing_id and new text
                     $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -ExpectJson:$false -Context $fullname
+                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -AllowNonJsonResponse -Context $fullname
                     $summary.edited++
                     $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                 }
@@ -929,7 +929,7 @@ while ($true) {
                 if (-not $DryRun) {
                     try {
                         $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
-                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -ExpectJson:$false -Context $fullname
+                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -AllowNonJsonResponse -Context $fullname
                         $summary.edited++
                         $editStatus = 'edited(2/2)'
                     }
@@ -954,7 +954,7 @@ while ($true) {
             try {
                 # Reddit's del endpoint requires the thing's full name
                 $body = @{ id = $fullname }
-                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -ExpectJson:$false -Context $fullname
+                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -AllowNonJsonResponse -Context $fullname
                 $summary.deleted++
                 $deleteStatus = 'deleted'
             }
