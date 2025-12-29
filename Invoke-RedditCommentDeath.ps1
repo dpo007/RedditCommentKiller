@@ -918,7 +918,13 @@ while ($true) {
 
             # Optional second overwrite pass for a stable-random subset of comments
             if ($doTwoPass) {
-                $overwriteText2 = Get-OverwriteText -Mode $OverwriteMode
+                # Try to ensure the second overwrite differs from the first (avoid accidental duplicates)
+                $overwriteText2 = $null
+                for ($i = 0; $i -lt 3; $i++) {
+                    $candidate = Get-OverwriteText -Mode $OverwriteMode
+                    if ($candidate -ne $overwriteText) { $overwriteText2 = $candidate; break }
+                }
+                if (-not $overwriteText2) { $overwriteText2 = Get-OverwriteText -Mode $OverwriteMode }
 
                 if (-not $DryRun) {
                     try {
