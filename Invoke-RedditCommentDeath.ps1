@@ -95,7 +95,6 @@ param(
     [Parameter(Mandatory = $true)]
     [SecureString]$Password,
 
-    [Parameter(Mandatory = $false)]
     [string]$UserAgent,
 
     [Parameter(Mandatory = $true)]
@@ -201,7 +200,10 @@ function ConvertFrom-SecureStringPlain {
     .SYNOPSIS
     Securely converts SecureString to plain text with proper memory cleanup.
     #>
-    param([SecureString]$Secure)
+    param(
+        [Parameter(Mandatory = $true)]
+        [SecureString]$Secure
+    )
     # Convert SecureString to BSTR (unmanaged memory)
     $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
     try {
@@ -276,9 +278,13 @@ function Get-AccessToken {
     Obtains OAuth access token using Reddit's resource owner password flow.
     #>
     param(
+        [Parameter(Mandatory = $true)]
         [string]$ClientId,
+        [Parameter(Mandatory = $true)]
         [string]$ClientSecret,
+        [Parameter(Mandatory = $true)]
         [string]$Username,
+        [Parameter(Mandatory = $true)]
         [SecureString]$Password,
         [string]$UserAgent
     )
@@ -324,7 +330,12 @@ function Get-RandomDelay {
     .SYNOPSIS
     Generates a random delay to mimic human behavior and avoid rate limits.
     #>
-    param([int]$MinSeconds, [int]$MaxSeconds)
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MinSeconds,
+        [Parameter(Mandatory = $true)]
+        [int]$MaxSeconds
+    )
     # If max <= min, just return min (no randomization possible)
     if ($MaxSeconds -le $MinSeconds) { return $MinSeconds }
     # Get-Random's -Maximum is exclusive, so add 1 to include MaxSeconds
@@ -339,7 +350,10 @@ function Get-OverwriteText {
     Provides three methods: rotating neutral phrases, random junk text, or fixed text.
     Overwriting before deletion helps prevent data recovery from Reddit's archives.
     #>
-    param([string]$Mode)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Mode
+    )
     # Collection of innocuous phrases to replace comment content
     $phrases = @(
         'Nothing to see here.',
@@ -393,7 +407,10 @@ function Invoke-RedditApi {
     Wrapper for Reddit API calls with automatic retry, rate-limit handling, and token refresh.
     #>
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Method,
+
+        [Parameter(Mandatory = $true)]
         [string]$Uri,
         [hashtable]$Body,
         [hashtable]$Query,
@@ -637,7 +654,9 @@ function Get-CommentsPage {
     .SYNOPSIS
     Fetches a page of user comments using Reddit's listing pagination.
     #>
-    param([string]$AfterToken)
+    param(
+        [string]$AfterToken
+    )
     # Reddit's listing API uses 'limit' to control page size (max 100)
     $query = @{ limit = 100 }
 
@@ -653,7 +672,10 @@ function Save-Checkpoint {
     .SYNOPSIS
     Saves current processing state to enable resume after interruption.
     #>
-    param($State)
+    param(
+        [Parameter(Mandatory = $true)]
+        $State
+    )
     # Serialize state to JSON
     $json = $State | ConvertTo-Json -Depth 5
 
@@ -705,7 +727,6 @@ function Add-ProcessedIds {
         [Parameter(Mandatory = $true)]
         [string[]]$Ids
     )
-
     if (-not $Ids -or $Ids.Count -eq 0) { return }
 
     Initialize-ProcessedLog
@@ -760,7 +781,10 @@ function Add-ReportRow {
     .SYNOPSIS
     Appends a single row to the CSV report.
     #>
-    param([PSCustomObject]$Row)
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Row
+    )
     # Append without re-writing headers
     $Row | Export-Csv -Path $ReportPath -NoTypeInformation -Append
 }
