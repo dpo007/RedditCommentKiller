@@ -602,11 +602,11 @@ function Invoke-RedditApi {
                     $ex -is [System.Net.WebException] -or
                     $ex -is [System.TimeoutException] -or
                     ($ex.InnerException -and (
-                            $ex.InnerException -is [System.Net.Http.HttpRequestException] -or
-                            $ex.InnerException -is [System.Net.WebException] -or
-                            $ex.InnerException -is [System.Net.Sockets.SocketException] -or
-                            $ex.InnerException -is [System.TimeoutException]
-                        ))
+                        $ex.InnerException -is [System.Net.Http.HttpRequestException] -or
+                        $ex.InnerException -is [System.Net.WebException] -or
+                        $ex.InnerException -is [System.Net.Sockets.SocketException] -or
+                        $ex.InnerException -is [System.TimeoutException]
+                    ))
                 )
             }
 
@@ -975,7 +975,7 @@ while ($true) {
                 permalink   = $permalink
                 subreddit   = $subreddit
                 fullname    = $fullname
-            action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
+                action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
                 status      = "$editStatus/$deleteStatus"
                 error       = $errorMessage
             })
