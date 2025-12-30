@@ -334,8 +334,25 @@ function Get-AccessToken {
         $plainRefreshToken = $null
     }
 
-    # Calculate expiration time with 30-second buffer to ensure we refresh before actual expiry
-    $expiresAt = (Get-Date).ToUniversalTime().AddSeconds([int]$resp.expires_in - 30)
+    # Calculate expiration time with 30-second buffer to ensure we refresh before actual expiry.
+    # Be defensive: expires_in can be missing or non-numeric; default to 3600s in that case.
+    $expiresInSeconds = 3600
+    try {
+        $tmp = 0
+        if ($null -ne $resp -and $resp.PSObject.Properties.Match('expires_in').Count -gt 0 -and [int]::TryParse([string]$resp.expires_in, [ref]$tmp) -and $tmp -gt 0) {
+            $expiresInSeconds = $tmp
+        }
+        elseif ($VerboseLogging) {
+            Write-Verbose "Token response missing/invalid expires_in; defaulting expiry to ${expiresInSeconds}s"
+        }
+    }
+    catch {
+        if ($VerboseLogging) { Write-Verbose "Token response expires_in parsing failed; defaulting expiry to ${expiresInSeconds}s" }
+    }
+
+    $bufferSeconds = 30
+    $effectiveExpiresIn = [Math]::Max($expiresInSeconds - $bufferSeconds, 1)
+    $expiresAt = (Get-Date).ToUniversalTime().AddSeconds($effectiveExpiresIn)
 
     # Cache token information at script scope for reuse
     $Script:TokenInfo = [PSCustomObject]@{
@@ -367,9 +384,35 @@ function Confirm-AuthenticatedIdentity {
 
     # Ensure we have a token before calling /me
     Confirm-AccessToken
+    if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
+        throw 'Access token missing after Confirm-AccessToken.'
+    }
 
-    $resp = Invoke-RedditApi -Method Get -Uri 'https://oauth.reddit.com/api/v1/me' -Context 'me'
-    $me = $resp.Data
+    # IMPORTANT: Call /api/v1/me without Invoke-RedditApi to avoid any future recursion footguns.
+    $headers = @{ 'Authorization' = "bearer $($Script:TokenInfo.AccessToken)"; 'User-Agent' = $UserAgent }
+    $resp = Invoke-WebRequest -Method Get -Uri 'https://oauth.reddit.com/api/v1/me' -Headers $headers -ErrorAction Stop
+
+    $rawContent = $resp.Content
+    if ([string]::IsNullOrWhiteSpace([string]$rawContent)) {
+        throw 'Unable to verify authenticated user via /api/v1/me (empty response body).'
+    }
+    $trimmed = ([string]$rawContent).Trim()
+    if ($trimmed -match '<!DOCTYPE html|<html') {
+        throw 'Unexpected HTML response from Reddit /api/v1/me (possible auth/rate-limit/protection page).'
+    }
+
+    $me = $null
+    try {
+        $me = $rawContent | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        $snippetLength = [Math]::Min([int]$rawContent.Length, 500)
+        $snippet = $rawContent.Substring(0, $snippetLength)
+        $snippet = $snippet -replace "`r", '' -replace "`n", ' '
+        $parseMsg = $_.Exception.Message
+        throw "Unable to verify authenticated user via /api/v1/me (JSON parse failed). $parseMsg Snippet: $snippet"
+    }
+
     $name = $null
     if ($null -ne $me -and $me.PSObject.Properties.Match('name').Count -gt 0) {
         $name = [string]$me.name
