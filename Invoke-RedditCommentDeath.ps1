@@ -1199,6 +1199,70 @@ function ConvertTo-SafeCsvCell {
     return $Value
 }
 
+function ConvertTo-SingleLineText {
+    param(
+        [AllowNull()]
+        [string]$Text,
+
+        [ValidateRange(1, 1000)]
+        [int]$MaxLength = 120
+    )
+
+    if ($null -eq $Text) { return '' }
+    $t = ([string]$Text) -replace '\s+', ' '
+    $t = $t.Trim()
+    if ($t.Length -gt $MaxLength) {
+        return $t.Substring(0, $MaxLength - 1) + '…'
+    }
+    return $t
+}
+
+function Get-ThreadTitleFromPermalink {
+    <#
+    .SYNOPSIS
+    Best-effort extraction of a submission title slug from a Reddit comment permalink.
+
+    .DESCRIPTION
+    We avoid extra API calls. Reddit permalinks typically look like:
+    /r/{sub}/comments/{postId}/{titleSlug}/{commentId}/
+    #>
+    param(
+        [AllowNull()]
+        [string]$Permalink
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Permalink)) { return '' }
+
+    try {
+        $path = $Permalink
+
+        # Allow either absolute URL or relative path
+        if ($path -match '^https?://') {
+            $path = ([Uri]$path).AbsolutePath
+        }
+
+        $parts = $path.Trim('/').Split('/')
+        if (-not $parts -or $parts.Count -lt 6) { return '' }
+
+        $idx = [Array]::IndexOf($parts, 'comments')
+        if ($idx -lt 0) { return '' }
+
+        # comments/{postId}/{titleSlug}/...
+        $slugIndex = $idx + 2
+        if ($slugIndex -ge $parts.Count) { return '' }
+
+        $slug = [string]$parts[$slugIndex]
+        if ([string]::IsNullOrWhiteSpace($slug)) { return '' }
+
+        $decoded = [Uri]::UnescapeDataString($slug)
+        $decoded = $decoded -replace '[-_]+', ' '
+        return ConvertTo-SingleLineText -Text $decoded -MaxLength 120
+    }
+    catch {
+        return ''
+    }
+}
+
 function Add-ReportRow {
     <#
     .SYNOPSIS
@@ -1229,6 +1293,9 @@ $processedSet = Import-ProcessedLog
 if ($null -eq $processedSet) {
     $processedSet = [System.Collections.Generic.HashSet[string]]::new()
 }
+
+# Used for console progress output; starts from whatever has already been processed in prior runs.
+$processedCount = $processedSet.Count
 
 $excludedSubredditsSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if ($PSBoundParameters.ContainsKey('ExcludedSubredditsFile') -and -not [string]::IsNullOrWhiteSpace($ExcludedSubredditsFile)) {
@@ -1265,6 +1332,9 @@ if ($state.processed -and $state.processed.Count -gt 0) {
         Write-Host "Migrated $($toAppend.Count) legacy processed IDs into $ProcessedLogPath" -ForegroundColor Yellow
     }
 }
+
+# Refresh counter after migration in case legacy IDs were added.
+$processedCount = $processedSet.Count
 
 # Two-pass overwrite selection uses a stable local salt.
 $twoPassSalt = $null
@@ -1354,6 +1424,17 @@ while ($true) {
             $subreddit = $comment.subreddit_name_prefixed
         }
         $subredditNormalized = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
+
+        $threadTitle = ''
+        if ($comment.PSObject.Properties.Match('link_title').Count -gt 0) {
+            $threadTitle = ConvertTo-SingleLineText -Text ([string]$comment.link_title) -MaxLength 120
+        }
+        if ([string]::IsNullOrWhiteSpace($threadTitle)) {
+            $threadTitle = Get-ThreadTitleFromPermalink -Permalink $permalink
+        }
+        if ([string]::IsNullOrWhiteSpace($threadTitle)) {
+            $threadTitle = '(unknown thread)'
+        }
 
         # Safety rule: never process anything newer than the cutoff, even if Reddit returns out-of-order items.
         if ($createdUtc -gt $effectiveCutoffUtc) { continue }
@@ -1491,6 +1572,15 @@ while ($true) {
         # Mark as processed to avoid reprocessing on resume
         if ($processedSet.Add($fullname)) {
             Add-ProcessedIds -Ids @($fullname)
+
+            $processedCount++
+            $displaySub = $subredditNormalized
+            if ([string]::IsNullOrWhiteSpace([string]$displaySub)) {
+                $displaySub = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$displaySub)) { $displaySub = 'unknown' }
+
+            Write-Host ("{0} - r/{1} - {2}" -f $processedCount, $displaySub, $threadTitle) -ForegroundColor DarkGray
         }
         $batchCount++
 
