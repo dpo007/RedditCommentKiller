@@ -17,6 +17,9 @@ Reddit username to authenticate and target.
 .PARAMETER Password
 Reddit account password as a SecureString. Converted to plain text only for the token request.
 
+.PARAMETER RefreshToken
+OAuth refresh token as a SecureString. If provided, the script will use the refresh-token grant instead of the password grant.
+
 .PARAMETER UserAgent
 User-Agent string Reddit requires (e.g. "platform:app:v1 (by /u/yourname)"). If not provided, automatically generated from your username.
 
@@ -94,6 +97,8 @@ param(
 
     [Parameter(Mandatory = $true)]
     [SecureString]$Password,
+
+    [SecureString]$RefreshToken,
 
     [string]$UserAgent,
 
@@ -275,7 +280,7 @@ $Script:RedditApiLastRequestAtUtc = $null
 function Get-AccessToken {
     <#
     .SYNOPSIS
-    Obtains OAuth access token using Reddit's resource owner password flow.
+    Obtains OAuth access token using Reddit's password grant or refresh-token grant.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -286,21 +291,38 @@ function Get-AccessToken {
         [string]$Username,
         [Parameter(Mandatory = $true)]
         [SecureString]$Password,
+        [SecureString]$RefreshToken,
         [string]$UserAgent
     )
 
-    # Convert SecureString password to plain text (only used for this API call)
-    $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
+    # Convert SecureString secret(s) to plain text only for this API call.
+    # Prefer refresh-token grant when available to avoid handling account passwords.
+    $plainPassword = $null
+    $plainRefreshToken = $null
 
     # Reddit requires Basic authentication with client_id:client_secret
     $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ClientId`:$ClientSecret"))
 
-    # OAuth2 password grant flow requires grant_type, username, and password
-    $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
     $headers = @{ 'User-Agent' = $UserAgent; Authorization = "Basic $basicAuth" }
 
-    # Request access token from Reddit's OAuth endpoint
-    $resp = Invoke-RestMethod -Method Post -Uri 'https://www.reddit.com/api/v1/access_token' -Headers $headers -Body $body -ErrorAction Stop
+    try {
+        if ($RefreshToken -and $RefreshToken.Length -gt 0) {
+            $plainRefreshToken = ConvertFrom-SecureStringPlain -Secure $RefreshToken
+            $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
+        }
+        else {
+            $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
+            $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
+        }
+
+        # Request access token from Reddit's OAuth endpoint
+        $resp = Invoke-RestMethod -Method Post -Uri 'https://www.reddit.com/api/v1/access_token' -Headers $headers -Body $body -ErrorAction Stop
+    }
+    finally {
+        # Best-effort: shorten lifetime of managed strings (cannot truly zero a .NET string).
+        $plainPassword = $null
+        $plainRefreshToken = $null
+    }
 
     # Calculate expiration time with 30-second buffer to ensure we refresh before actual expiry
     $expiresAt = (Get-Date).ToUniversalTime().AddSeconds([int]$resp.expires_in - 30)
@@ -321,7 +343,28 @@ function Confirm-AccessToken {
     #>
     # Check if token is missing or expired; if so, obtain a new one
     if (-not $Script:TokenInfo -or (Get-Date).ToUniversalTime() -gt $Script:TokenInfo.ExpiresAt) {
-        Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -UserAgent $UserAgent
+        Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
+    }
+}
+
+function Assert-RedditApiOk {
+    <#
+    .SYNOPSIS
+    Throws if Reddit API returned structured errors.
+    #>
+    param(
+        $Data,
+        [string]$Context
+    )
+
+    if ($null -eq $Data) { return }
+
+    if ($Data.PSObject.Properties.Match('json').Count -gt 0 -and $Data.json) {
+        if ($Data.json.PSObject.Properties.Match('errors').Count -gt 0 -and $Data.json.errors -and $Data.json.errors.Count -gt 0) {
+            $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
+            $errorsJson = $Data.json.errors | ConvertTo-Json -Compress
+            throw "Reddit API returned errors${ctx}: $errorsJson"
+        }
     }
 }
 
@@ -480,7 +523,16 @@ function Invoke-RedditApi {
             $parseError = $null
 
             if ($rawContent) {
-                if (-not $AllowNonJsonResponse) {
+                $trimmed = ([string]$rawContent).Trim()
+
+                # AllowNonJsonResponse is intended for endpoints that return empty/opaque bodies, not HTML defenses.
+                if ($trimmed -match '<!DOCTYPE html|<html') {
+                    throw "Unexpected HTML response from Reddit (possible auth/rate-limit/protection page)."
+                }
+
+                # If it looks like JSON, parse it strictly even when AllowNonJsonResponse is set.
+                $looksJson = $trimmed.StartsWith('{') -or $trimmed.StartsWith('[')
+                if (-not $AllowNonJsonResponse -or $looksJson) {
                     try {
                         $content = $rawContent | ConvertFrom-Json -ErrorAction Stop
                     }
@@ -500,11 +552,8 @@ function Invoke-RedditApi {
                     }
                 }
                 else {
-                    # AllowNonJsonResponse is intended for endpoints that return empty/opaque bodies, not HTML defenses.
-                    if ($rawContent -match '<!DOCTYPE html|<html') {
-                        throw "Unexpected HTML response from Reddit (possible auth/rate-limit/protection page)."
-                    }
-                    $content = $rawContent | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    # Non-JSON body allowed only when explicitly requested.
+                    $content = $null
                 }
             }
 
@@ -525,6 +574,10 @@ function Invoke-RedditApi {
             if ($IsWrite -and $AllowNonJsonResponse -and $null -ne $statusCode -and $statusCode -ne 200 -and $statusCode -ne 204) {
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
                 throw "Unexpected status code $statusCode for $Method $Uri$ctx (expected 200/204)."
+            }
+
+            if ($IsWrite) {
+                Assert-RedditApiOk -Data $content -Context $Context
             }
 
             if ($VerboseLogging) { Write-Verbose "API $Method $Uri status $($resp.StatusCode) attempt $attempt" }
@@ -638,7 +691,7 @@ function Invoke-RedditApi {
             if ($status -eq 401 -and -not $refreshedOn401 -and $attempt -lt $maxAttempts) {
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
                 Write-Warning "API call returned 401 Unauthorized$ctx; refreshing token and retrying once."
-                Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -UserAgent $UserAgent
+                Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
                 $refreshedOn401 = $true
                 continue
             }
@@ -815,6 +868,20 @@ function Initialize-Report {
     [PSCustomObject]@{ created_utc = ''; permalink = ''; subreddit = ''; fullname = ''; action = ''; status = ''; error = '' } | Export-Csv -Path $ReportPath -NoTypeInformation
 }
 
+function ConvertTo-SafeCsvCell {
+    <#
+    .SYNOPSIS
+    Prevents CSV formula injection when opening reports in spreadsheet apps.
+    #>
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+    if ($null -eq $Value) { return '' }
+    if ($Value.Length -gt 0 -and $Value[0] -match '^[=\+\-@]') { return "'$Value" }
+    return $Value
+}
+
 function Add-ReportRow {
     <#
     .SYNOPSIS
@@ -961,7 +1028,7 @@ while ($true) {
                 try {
                     # Reddit's editusertext endpoint requires thing_id and new text
                     $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -AllowNonJsonResponse -Context $fullname
+                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -Context $fullname
                     $summary.edited++
                     $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                 }
@@ -994,7 +1061,7 @@ while ($true) {
                 if (-not $DryRun) {
                     try {
                         $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
-                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -AllowNonJsonResponse -Context $fullname
+                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -Context $fullname
                         $summary.edited++
                         $editStatus = 'edited(2/2)'
                     }
@@ -1018,8 +1085,8 @@ while ($true) {
         if (-not $DryRun) {
             try {
                 # Reddit's del endpoint requires the thing's full name
-                $body = @{ id = $fullname }
-                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -AllowNonJsonResponse -Context $fullname
+                $body = @{ api_type = 'json'; id = $fullname }
+                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -Context $fullname
                 $summary.deleted++
                 $deleteStatus = 'deleted'
             }
@@ -1037,12 +1104,12 @@ while ($true) {
         # Record this comment's processing result in CSV report
         Add-ReportRow ([PSCustomObject]@{
                 created_utc = $createdUtc.ToString('u')
-                permalink   = $permalink
-                subreddit   = $subreddit
-                fullname    = $fullname
+            permalink   = ConvertTo-SafeCsvCell -Value $permalink
+            subreddit   = ConvertTo-SafeCsvCell -Value ([string]$subreddit)
+            fullname    = ConvertTo-SafeCsvCell -Value $fullname
                 action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
-                status      = "$editStatus/$deleteStatus"
-                error       = $errorMessage
+            status      = ConvertTo-SafeCsvCell -Value "$editStatus/$deleteStatus"
+            error       = ConvertTo-SafeCsvCell -Value $errorMessage
             })
 
         # Mark as processed to avoid reprocessing on resume
