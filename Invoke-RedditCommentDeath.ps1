@@ -272,6 +272,9 @@ function Get-StableProbability {
 # This allows token reuse across API calls until expiration
 $Script:TokenInfo = $null
 
+# Script-level variable to store verified authenticated username (from /api/v1/me)
+$Script:AuthenticatedUsername = $null
+
 # Minimum spacing between Reddit API calls (fallback for endpoints that omit rate-limit headers).
 # Reddit's published free-access guidance is ~100 queries/minute (~0.6s per request).
 $Script:RedditApiMinRequestIntervalSeconds = 0.6
@@ -301,7 +304,7 @@ function Get-AccessToken {
     $plainRefreshToken = $null
 
     # Reddit requires Basic authentication with client_id:client_secret
-    $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ClientId`:$ClientSecret"))
+    $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${ClientId}:$ClientSecret"))
 
     $headers = @{ 'User-Agent' = $UserAgent; Authorization = "Basic $basicAuth" }
 
@@ -351,6 +354,37 @@ function Confirm-AccessToken {
     # Check if token is missing or expired; if so, obtain a new one
     if (-not $Script:TokenInfo -or (Get-Date).ToUniversalTime() -gt $Script:TokenInfo.ExpiresAt) {
         Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
+    }
+}
+
+function Confirm-AuthenticatedIdentity {
+    <#
+    .SYNOPSIS
+    Verifies the authenticated user via /api/v1/me and caches the username.
+    #>
+
+    if (-not [string]::IsNullOrWhiteSpace($Script:AuthenticatedUsername)) { return }
+
+    # Ensure we have a token before calling /me
+    Confirm-AccessToken
+
+    $resp = Invoke-RedditApi -Method Get -Uri 'https://oauth.reddit.com/api/v1/me' -Context 'me'
+    $me = $resp.Data
+    $name = $null
+    if ($null -ne $me -and $me.PSObject.Properties.Match('name').Count -gt 0) {
+        $name = [string]$me.name
+    }
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        throw "Unable to verify authenticated user via /api/v1/me (missing name in response)."
+    }
+
+    $Script:AuthenticatedUsername = $name
+    if ($VerboseLogging) { Write-Verbose "Authenticated as /u/$($Script:AuthenticatedUsername) (verified via /api/v1/me)" }
+
+    # Guard against silent no-ops/misconfig: ensure -Username matches the authenticated identity.
+    if (-not [string]::Equals($Script:AuthenticatedUsername, $Username, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Authenticated as /u/$($Script:AuthenticatedUsername), but -Username was '$Username'. Refusing to continue to avoid targeting the wrong account or doing a silent no-op."
     }
 }
 
@@ -762,7 +796,9 @@ function Get-CommentsPage {
     # 'after' token is used for pagination (Reddit's cursor-based paging)
     if ($AfterToken) { $query.after = $AfterToken }
 
-    $uri = "https://oauth.reddit.com/user/$Username/comments"
+    $targetUser = $Script:AuthenticatedUsername
+    if ([string]::IsNullOrWhiteSpace($targetUser)) { $targetUser = $Username }
+    $uri = "https://oauth.reddit.com/user/$targetUser/comments"
     Invoke-RedditApi -Method Get -Uri $uri -Query $query
 }
 
@@ -856,6 +892,14 @@ function Import-Checkpoint {
         }
         catch {
             # If checkpoint is corrupted, warn and start fresh
+            if ($VerboseLogging) {
+                $ex = $_.Exception
+                $typeName = ($null -ne $ex) ? $ex.GetType().FullName : 'unknown'
+                $msg = ($null -ne $ex) ? $ex.Message : 'unknown error'
+                $innerMsg = ($null -ne $ex -and $ex.InnerException) ? $ex.InnerException.Message : $null
+                $extra = [string]::IsNullOrWhiteSpace($innerMsg) ? '' : " Inner: $innerMsg"
+                Write-Verbose "Failed to parse checkpoint at '$ResumePath': ${typeName}: $msg$extra"
+            }
             Write-Warning "Failed to parse checkpoint; starting fresh."
         }
     }
@@ -944,6 +988,10 @@ if ($TwoPassProbability -gt 0) {
 
 # Ensure CSV report exists with headers
 Initialize-Report
+
+# Verify authenticated identity once and use it for listing/reporting
+Confirm-AuthenticatedIdentity
+Write-Host "Authenticated as /u/$($Script:AuthenticatedUsername)" -ForegroundColor Green
 
 # Track processing statistics for final summary
 $summary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
