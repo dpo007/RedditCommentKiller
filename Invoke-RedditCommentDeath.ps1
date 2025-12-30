@@ -379,7 +379,7 @@ function ConvertFrom-SecureStringPlain {
     }
 }
 
-function Normalize-SubredditName {
+function ConvertTo-NormalizedSubredditName {
     <#
     .SYNOPSIS
     Normalizes subreddit names to a canonical form for comparisons.
@@ -492,7 +492,7 @@ function Build-RedditUri {
         [string]$Path
     )
 
-    Ensure-AuthProviderInitialized
+    Initialize-AuthProvider
 
     $base = $null
     if ($Script:AuthProvider -and $Script:AuthProvider.PSObject.Properties.Match('ApiBaseUri').Count -gt 0) {
@@ -604,7 +604,7 @@ function New-AuthProvider {
     }
 }
 
-function Ensure-AuthProviderInitialized {
+function Initialize-AuthProvider {
     <#
     .SYNOPSIS
     Ensures the script-level auth provider exists.
@@ -614,12 +614,12 @@ function Ensure-AuthProviderInitialized {
     }
 }
 
-function Ensure-AuthIsReady {
+function Confirm-AuthIsReady {
     <#
     .SYNOPSIS
     Ensures the provider has valid auth state before a request.
     #>
-    Ensure-AuthProviderInitialized
+    Initialize-AuthProvider
     $Script:AuthProvider.EnsureValidAuth.Invoke()
 }
 
@@ -628,16 +628,16 @@ function Get-AuthHeadersFromProvider {
     .SYNOPSIS
     Retrieves headers from the active auth provider.
     #>
-    Ensure-AuthProviderInitialized
+    Initialize-AuthProvider
     return $Script:AuthProvider.GetAuthHeaders.Invoke()
 }
 
-function Try-RefreshAuthOnce {
+function Invoke-AuthRefreshOnce {
     <#
     .SYNOPSIS
     Attempts a single refresh via the provider (if supported).
     #>
-    Ensure-AuthProviderInitialized
+    Initialize-AuthProvider
     if ($Script:AuthProvider.PSObject.Methods.Match('TryRefreshOnce').Count -gt 0) {
         return [bool]$Script:AuthProvider.TryRefreshOnce.Invoke()
     }
@@ -754,7 +754,7 @@ function Confirm-AuthenticatedIdentity {
 
     if (-not [string]::IsNullOrWhiteSpace($Script:AuthenticatedUsername)) { return }
 
-    Ensure-AuthIsReady
+    Confirm-AuthIsReady
     $headers = Get-AuthHeadersFromProvider
     $meUri = Build-RedditUri -Path '/api/v1/me'
 
@@ -772,9 +772,9 @@ function Confirm-AuthenticatedIdentity {
         catch { $status = $null }
 
         if (($status -eq 401 -or $status -eq 403) -and -not $refreshed) {
-            $refreshed = Try-RefreshAuthOnce
+            $refreshed = Invoke-AuthRefreshOnce
             if ($refreshed) {
-                Ensure-AuthIsReady
+                Confirm-AuthIsReady
                 $headers = Get-AuthHeadersFromProvider
                 $resp = Invoke-WebRequest -Method Get -Uri $meUri -Headers $headers -ErrorAction Stop
             }
@@ -945,7 +945,7 @@ function Invoke-RedditRequest {
         [string]$Context
     )
 
-    Ensure-AuthIsReady
+    Confirm-AuthIsReady
 
     # Retry configuration for transient failures
     $maxAttempts = 5
@@ -1239,10 +1239,10 @@ function Invoke-RedditRequest {
             if (($status -eq 401 -or $status -eq 403) -and -not $refreshedOnAuthFailure -and $attempt -lt $maxAttempts) {
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
                 Write-Warning "API call returned $status$ctx; attempting a single auth refresh."
-                $refreshed = Try-RefreshAuthOnce
+                $refreshed = Invoke-AuthRefreshOnce
                 if ($refreshed) {
                     $refreshedOnAuthFailure = $true
-                    Ensure-AuthIsReady
+                    Confirm-AuthIsReady
                     continue
                 }
 
@@ -1504,7 +1504,7 @@ if ($PSBoundParameters.ContainsKey('ExcludedSubredditsFile') -and -not [string]:
         if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
         if ($trimmed.StartsWith('#')) { continue }
 
-        $normalized = Normalize-SubredditName -Name $trimmed
+        $normalized = ConvertTo-NormalizedSubredditName -Name $trimmed
         if ($normalized) {
             $excludedSubredditsSet.Add($normalized) | Out-Null
         }
@@ -1541,7 +1541,7 @@ if ($TwoPassProbability -gt 0) {
 Initialize-Report
 
 # Initialize auth provider early to surface auth-mode issues before destructive actions
-Ensure-AuthProviderInitialized
+Initialize-AuthProvider
 
 # Verify authenticated identity once and use it for listing/reporting
 Confirm-AuthenticatedIdentity
@@ -1584,7 +1584,30 @@ while ($true) {
         $summary.scanned++
 
         # Convert Unix timestamp to UTC DateTime for age comparison (Reddit timestamps are UTC)
-        $createdUtc = [DateTimeOffset]::FromUnixTimeSeconds([long]$comment.created_utc).UtcDateTime
+        # Guard against malformed/empty created_utc values (can otherwise flip $pastCutoffZone too early).
+        $createdUtcSeconds = 0L
+        $createdUtc = $null
+        try {
+            $rawCreated = $comment.created_utc
+            if ($null -ne $rawCreated) {
+                if ($rawCreated -is [double] -or $rawCreated -is [float] -or $rawCreated -is [decimal]) {
+                    $createdUtcSeconds = [int64][math]::Floor([double]$rawCreated)
+                }
+                else {
+                    $createdUtcSeconds = [int64]$rawCreated
+                }
+            }
+        }
+        catch {
+            $createdUtcSeconds = 0L
+        }
+        if ($createdUtcSeconds -gt 0) {
+            $createdUtc = [DateTimeOffset]::FromUnixTimeSeconds($createdUtcSeconds).UtcDateTime
+        }
+        else {
+            if ($VerboseLogging) { Write-Verbose "Skipping item with missing/invalid created_utc (fullname=$($comment.name))" }
+            continue
+        }
 
         # Extract comment identifiers and metadata
         $fullname = $comment.name  # Reddit's full thing ID (e.g., "t1_abc123")
@@ -1595,14 +1618,13 @@ while ($true) {
         if ([string]::IsNullOrWhiteSpace([string]$subreddit) -and $comment.PSObject.Properties.Match('subreddit_name_prefixed').Count -gt 0) {
             $subreddit = $comment.subreddit_name_prefixed
         }
-        $subredditNormalized = Normalize-SubredditName -Name ([string]$subreddit)
+        $subredditNormalized = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
 
-        # Listing is newest -> oldest. Skip newer-than-cutoff and keep paging until end.
-        if (-not $pastCutoffZone) {
-            if ($createdUtc -gt $effectiveCutoffUtc) { continue }
-            # We have reached the cutoff zone; all remaining items are older.
-            $pastCutoffZone = $true
-        }
+        # Safety rule: never process anything newer than the cutoff, even if Reddit returns out-of-order items.
+        if ($createdUtc -gt $effectiveCutoffUtc) { continue }
+
+        # Listing is typically newest -> oldest. Once we see the first older-than-cutoff item, we are in the cutoff zone.
+        if (-not $pastCutoffZone) { $pastCutoffZone = $true }
 
         # Optional exclusion: skip comments in excluded subreddits before accounting for paging stop logic.
         if ($excludedSubredditsSet.Count -gt 0 -and $subredditNormalized -and $excludedSubredditsSet.Contains($subredditNormalized)) {
