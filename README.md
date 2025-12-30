@@ -2,12 +2,14 @@
 
 A PowerShell 7 script that finds **your own** Reddit comments older than a chosen age, optionally **overwrites** them first, and then **deletes** them — with rate-limit friendliness, resume support, and a paper trail (CSV report).
 
-It’s basically spring cleaning for your comment history, except the broom is an OAuth token and the dust bunnies are `t1_` fullnames. 🧽✨
+It’s basically spring cleaning for your comment history. By default it runs using a session-derived token (single-user), and keeps OAuth support as a fallback. 🧽✨
+
+**Auth note (important):** Session-derived token reuse is the primary/default mode. OAuth is supported only as a secondary fallback because Reddit OAuth app approval and long-term reliability can be inconsistent or unavailable for some users.
 
 ## ✅ What this is
 
 - 🧩 A single-file PowerShell script: `Invoke-RedditCommentDeath.ps1`
-- 🔐 Auth: session-derived token reuse by default; OAuth (script app) still available
+- 🔐 Auth (recommended): session-derived token reuse (default); OAuth still available as a fallback
 - 🔎 Scans your user comment listing (newest → oldest)
 - ⏳ Processes comments older than `-DaysOld`
 - ✍️🧼 Optionally overwrites comment text (default) before deleting
@@ -26,9 +28,11 @@ It’s basically spring cleaning for your comment history, except the broom is a
 ## 🛡️ Features (aka “the safety rails”)
 
 - 🔑 **Two auth modes (exactly one, default SessionDerived):**
-  - Session-derived token reuse (`-SessionAccessToken`, optional `-SessionApiBaseUri` / `-SessionAuthorizationScheme`), single-user only
-  - OAuth: password grant (`-Password`) or refresh-token grant (`-RefreshToken`) with `-AuthMode OAuth`
-- 🧑‍⚖️ **Identity verification:** confirms `/api/v1/me` matches `-Username` before doing anything destructive.
+  - Primary (recommended): session-derived token reuse (`-SessionAccessToken`), single-user only
+  - Secondary (fallback): OAuth with password grant (`-Password`) or refresh-token grant (`-RefreshToken`) plus `-ClientId`/`-ClientSecret`
+
+Why is OAuth “secondary”? In practice, Reddit OAuth app approval and long-term reliability can be inconsistent or unavailable for some users, so session-derived mode is the smoother path when it works for your account.
+- 🧑‍⚖️ **Identity verification:** verifies `/api/v1/me` and (if you supplied `-Username`) enforces that it matches before doing anything destructive.
 - 🔁 **Resume support:** safe to stop/re-run; it won’t reprocess already handled comments.
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
 - 🧪 **Dry runs:** see what would happen without changing anything.
@@ -39,13 +43,13 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 - 🐉 **PowerShell 7+** (the script declares `#requires -Version 7.0`)
 - For the default session-derived mode: a session-derived access token from a logged-in Reddit session (passed securely via `-SessionAccessToken`); `-Username` is optional and will be adopted from `/api/v1/me` if omitted.
-- For OAuth mode (`-AuthMode OAuth`): a Reddit **script app** (client id + secret) and either `-Password` or `-RefreshToken` (not both). `-Username` is optional but recommended; it will be enforced against `/api/v1/me` if supplied.
+- For OAuth mode (fallback): a Reddit **script app** (client id + secret) and either `-Password` or `-RefreshToken` (not both). `-Username` is optional but recommended; it will be enforced against `/api/v1/me` if supplied.
 - 🧭 OAuth scopes if using OAuth mode:
   - listing: `identity,history,read`
   - overwriting: `edit`
   - deleting: handled by the authenticated API flow used by the script
 
-## 🚀 Quick start (default: session-derived)
+## 🚀 Quick start (primary/default: session-derived)
 
 1) Obtain a session-derived token from your logged-in Reddit session (treat as highly sensitive; do not log it).
 
@@ -53,7 +57,6 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -Username "YOUR_USERNAME" `
   -SessionAccessToken (Read-Host "Session token" -AsSecureString) `
   -DaysOld 90 `
   -DryRun
@@ -63,7 +66,6 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -Username "YOUR_USERNAME" `
   -SessionAccessToken (Read-Host "Session token" -AsSecureString) `
   -DaysOld 90
 ```
@@ -83,15 +85,12 @@ Then run:
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
-  -Username "YOUR_USERNAME" `
-  -Password (Read-Host "Password" -AsSecureString) `
+  -SessionAccessToken (Read-Host "Session token" -AsSecureString) `
   -DaysOld 90 `
   -ExcludedSubredditsFile "./excluded-subreddits.txt"
 ```
 
-### OAuth quick start (alternate)
+### OAuth quick start (secondary / fallback)
 
 1) Create a Reddit “script” app to get a **Client ID** and **Client Secret**:
 - https://www.reddit.com/prefs/apps
@@ -100,7 +99,6 @@ Then run:
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -AuthMode OAuth `
   -ClientId "YOUR_ID" `
   -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `
@@ -113,7 +111,6 @@ Then run:
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -AuthMode OAuth `
   -ClientId "YOUR_ID" `
   -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `
@@ -125,21 +122,12 @@ Then run:
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -AuthMode OAuth `
   -ClientId "YOUR_ID" `
   -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `
   -RefreshToken (Read-Host "Refresh Token" -AsSecureString) `
   -DaysOld 90
 ```
-
-### 🧪 Session-derived mode (advanced, single-user)
-
-- Switch auth mode: `-AuthMode SessionDerived`
-- Provide a session-derived token securely: `-SessionAccessToken (Read-Host "Session token" -AsSecureString)`
-- Optional: `-SessionApiBaseUri` if your token expects a different base; `-SessionAuthorizationScheme` if the scheme is not `bearer`.
-- Treat the token as highly sensitive; do not log it and prefer OS-protected secret storage if you cache it externally.
-- Session reuse may be against Reddit’s terms and can trigger account enforcement. Use interactively, at low volume, and stop if you see challenges/HTML defenses.
 
 ## 📚 Where the real docs live
 
