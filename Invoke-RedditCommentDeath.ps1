@@ -3,35 +3,13 @@
 Deletes your own Reddit comments older than a chosen age, optionally overwriting them first.
 
 .DESCRIPTION
-PowerShell 7 script that authenticates to Reddit using a script app (personal use) via the resource owner password flow. It scans your comments, overwrites them for privacy (optional), and deletes them while respecting rate limits and offering resume/retry and reporting.
-
-.PARAMETER ClientId
-Reddit app client_id (personal use script app). Required when -AuthMode OAuth.
-
-.PARAMETER ClientSecret
-Reddit app client_secret. Required when -AuthMode OAuth.
-
-.PARAMETER Username
-Reddit username to authenticate and target.
-
-.PARAMETER AuthMode
-Selects the authentication provider: OAuth (default) or SessionDerived (session-derived token reuse).
-
-.PARAMETER Password
-Reddit account password as a SecureString. Converted to plain text only for the token request (OAuth mode only).
-
-Mutually exclusive with -RefreshToken.
-
-.PARAMETER RefreshToken
-OAuth refresh token as a SecureString. If provided, the script will use the refresh-token grant instead of the password grant (OAuth mode only).
-
-Mutually exclusive with -Password.
+PowerShell 7 script that authenticates to Reddit using a session-derived token taken from your logged-in browser session. It scans your comments, overwrites them for privacy (optional), and deletes them while respecting rate limits and offering resume/retry and reporting.
 
 .PARAMETER SessionAccessToken
 Session-derived access token as a SecureString (e.g., bearer-style token derived from a signed-in browser session). Never logged; kept in-memory.
 
 .PARAMETER SessionApiBaseUri
-API base URI to use when -AuthMode SessionDerived (default: https://oauth.reddit.com).
+API base URI to use with the session-derived token (default: https://oauth.reddit.com).
 
 .PARAMETER SessionAuthorizationScheme
 Authorization scheme/prefix to pair with the session-derived token (default: bearer).
@@ -40,7 +18,7 @@ Authorization scheme/prefix to pair with the session-derived token (default: bea
 Optional label/secret-name metadata for the session-derived token source (not stored). Useful if integrating with an OS-protected secret store externally.
 
 .PARAMETER UserAgent
-User-Agent string Reddit requires (e.g. "platform:app:v1 (by /u/yourname)"). If not provided, automatically generated from your username.
+User-Agent string Reddit requires (e.g. "platform:app:v1 (by /u/yourname)"). If not provided, a safe default is generated.
 
 .PARAMETER DaysOld
 Delete comments older than this many days.
@@ -100,71 +78,35 @@ List actions without performing edits or deletes.
 Emit extra diagnostic output.
 
 .EXAMPLE
-./Invoke-RedditCommentDeath.ps1 -ClientId abc -ClientSecret def -Username myuser -Password (Read-Host "Password" -AsSecureString) -DaysOld 90
+./Invoke-RedditCommentDeath.ps1 -SessionAccessToken (Read-Host "Session token" -AsSecureString) -DaysOld 90
 
 .EXAMPLE
-./Invoke-RedditCommentDeath.ps1 -ClientId abc -ClientSecret def -Username myuser -Password (Read-Host "Password" -AsSecureString) -DaysOld 30 -OverwriteMode FixedText -FixedOverwriteText "[deleted]" -UserAgent "custom:app:v1 (by /u/myuser)"
+./Invoke-RedditCommentDeath.ps1 -SessionAccessToken (Read-Host "Session token" -AsSecureString) -DaysOld 30 -OverwriteMode FixedText -FixedOverwriteText "[deleted]" -UserAgent "custom:app:v1 (by /u/myuser)"
 
 .EXAMPLE
-./Invoke-RedditCommentDeath.ps1 -ClientId abc -ClientSecret def -Username myuser -Password (Read-Host "Password" -AsSecureString) -DaysOld 14 -SkipOverwrite
+./Invoke-RedditCommentDeath.ps1 -SessionAccessToken (Read-Host "Session token" -AsSecureString) -DaysOld 14 -SkipOverwrite
 #>
 
 #requires -Version 7.0
 
-[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'SessionDerived')]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     # Common
-    [Parameter(ParameterSetName = 'SessionDerived')]
-    [Parameter(ParameterSetName = 'OAuthPassword')]
-    [Parameter(ParameterSetName = 'OAuthRefresh')]
-    [string]$Username,
-
-    [Parameter(ParameterSetName = 'SessionDerived')]
-    [Parameter(ParameterSetName = 'OAuthPassword')]
-    [Parameter(ParameterSetName = 'OAuthRefresh')]
-    [ValidateSet('SessionDerived', 'OAuth')]
-    [string]$AuthMode,
-
-    [Parameter(ParameterSetName = 'SessionDerived')]
-    [Parameter(ParameterSetName = 'OAuthPassword')]
-    [Parameter(ParameterSetName = 'OAuthRefresh')]
     [string]$UserAgent,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'SessionDerived')]
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
+    [Parameter(Mandatory = $true)]
     [ValidateRange(1, 5000)]
     [int]$DaysOld,
 
-    # Session-derived mode
-    [Parameter(Mandatory = $true, ParameterSetName = 'SessionDerived')]
+    # Session-derived mode (only)
+    [Parameter(Mandatory = $true)]
     [SecureString]$SessionAccessToken,
 
-    [Parameter(ParameterSetName = 'SessionDerived')]
     [string]$SessionApiBaseUri = 'https://oauth.reddit.com',
 
-    [Parameter(ParameterSetName = 'SessionDerived')]
     [string]$SessionAuthorizationScheme = 'bearer',
 
-    [Parameter(ParameterSetName = 'SessionDerived')]
     [string]$SessionSecretName,
-
-    # OAuth shared
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
-    [string]$ClientId,
-
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
-    [string]$ClientSecret,
-
-    # OAuth: password grant
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
-    [SecureString]$Password,
-
-    # OAuth: refresh-token grant
-    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
-    [SecureString]$RefreshToken,
 
     [ValidateRange(0, 720)]
     [int]$SafetyHours = 0,
@@ -224,51 +166,11 @@ param(
     [switch]$VerboseLogging
 )
 
-# Normalize AuthMode based on selected parameter set and enforce consistency
-switch ($PSCmdlet.ParameterSetName) {
-    'SessionDerived' {
-        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'SessionDerived' }
-        if (-not [string]::Equals($AuthMode, 'SessionDerived', [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "AuthMode '$AuthMode' is not allowed in the SessionDerived parameter set."
-        }
-    }
-    'OAuthPassword' {
-        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'OAuth' }
-        if (-not [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "AuthMode '$AuthMode' is not allowed in the OAuthPassword parameter set."
-        }
-    }
-    'OAuthRefresh' {
-        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'OAuth' }
-        if (-not [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "AuthMode '$AuthMode' is not allowed in the OAuthRefresh parameter set."
-        }
-    }
-    default {
-        throw "Unknown parameter set '$($PSCmdlet.ParameterSetName)'."
-    }
-}
-
-$usingOAuth = [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)
-$usingSessionDerived = -not $usingOAuth
-
-$hasPassword = $PSBoundParameters.ContainsKey('Password') -and $null -ne $Password
-$hasRefreshToken = $PSBoundParameters.ContainsKey('RefreshToken') -and $null -ne $RefreshToken
+# Validate required session-derived auth inputs
 $hasSessionToken = $PSBoundParameters.ContainsKey('SessionAccessToken') -and $null -ne $SessionAccessToken
-
-# Extra guardrails for parameter misuse across sets (PowerShell already enforces most conflicts)
-if ($usingSessionDerived) {
-    if (-not $hasSessionToken) { throw "SessionDerived mode requires -SessionAccessToken (SecureString)." }
-    if ([string]::IsNullOrWhiteSpace($SessionApiBaseUri)) { throw "-SessionApiBaseUri cannot be empty when -AuthMode SessionDerived." }
-    if ([string]::IsNullOrWhiteSpace($SessionAuthorizationScheme)) { throw "-SessionAuthorizationScheme cannot be empty when -AuthMode SessionDerived." }
-    if ($hasPassword -or $hasRefreshToken -or $PSBoundParameters.ContainsKey('ClientId') -or $PSBoundParameters.ContainsKey('ClientSecret')) {
-        throw "OAuth credentials/secrets are not used with -AuthMode SessionDerived; omit them to avoid accidental mixing of auth modes."
-    }
-}
-else {
-    if ($hasPassword -and $hasRefreshToken) { throw 'Specify either -Password or -RefreshToken, not both, when using OAuth.' }
-    if (-not $hasPassword -and -not $hasRefreshToken) { throw 'Specify one authentication method (-Password or -RefreshToken) when using OAuth.' }
-}
+if (-not $hasSessionToken) { throw 'Session-derived mode requires -SessionAccessToken (SecureString).' }
+if ([string]::IsNullOrWhiteSpace($SessionApiBaseUri)) { throw '-SessionApiBaseUri cannot be empty.' }
+if ([string]::IsNullOrWhiteSpace($SessionAuthorizationScheme)) { throw '-SessionAuthorizationScheme cannot be empty.' }
 
 # Validate delay range parameters to ensure min <= max
 if ($EditDelaySecondsMax -lt $EditDelaySecondsMin) {
@@ -346,9 +248,8 @@ function ConvertTo-HttpSafeUserAgent {
 # Auto-generate UserAgent if not provided (Reddit API requirement)
 if ([string]::IsNullOrWhiteSpace($UserAgent)) {
     $platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } elseif ($IsLinux) { 'linux' } else { 'unknown' }
-    $uaUser = [string]::IsNullOrWhiteSpace($Username) ? 'anonymous' : $Username
-    # Use an RFC/HttpClient-safe UA by default.
-    $UserAgent = "RedditCommentKiller/1.0 ($platform; by /u/$uaUser)"
+    # Use an RFC/HttpClient-safe UA by default without requiring a provided username.
+    $UserAgent = "RedditCommentKiller/1.0 ($platform; by session-user)"
     if ($VerboseLogging) { Write-Verbose "Generated UserAgent: $UserAgent" }
 }
 
@@ -449,10 +350,6 @@ function Get-StableProbability {
     return ([double]$u / ([double][UInt64]::MaxValue + 1.0))
 }
 
-# Script-level variable to store OAuth token and expiration time
-# This allows token reuse across API calls until expiration
-$Script:TokenInfo = $null
-
 # Script-level variable to store verified authenticated username (from /api/v1/me)
 $Script:AuthenticatedUsername = $null
 
@@ -505,39 +402,6 @@ function Build-RedditUri {
     return ($base.TrimEnd('/') + $normalizedPath)
 }
 
-function New-OAuthProvider {
-    <#
-    .SYNOPSIS
-    Creates an OAuth-backed auth provider that reuses the existing token flow.
-    #>
-    $provider = [PSCustomObject]@{
-        Name            = 'OAuth'
-        ApiBaseUri      = 'https://oauth.reddit.com'
-        SupportsRefresh = $true
-    }
-
-    $provider | Add-Member -MemberType ScriptMethod -Name EnsureValidAuth -Value {
-        Confirm-AccessToken
-        if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
-            throw 'Access token missing after Confirm-AccessToken.'
-        }
-    } -Force
-
-    $provider | Add-Member -MemberType ScriptMethod -Name GetAuthHeaders -Value {
-        if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
-            throw 'Access token missing when building headers.'
-        }
-        return @{ 'Authorization' = "bearer $($Script:TokenInfo.AccessToken)"; 'User-Agent' = $UserAgent }
-    } -Force
-
-    $provider | Add-Member -MemberType ScriptMethod -Name TryRefreshOnce -Value {
-        Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
-        return $true
-    } -Force
-
-    return $provider
-}
-
 function New-SessionDerivedTokenProvider {
     <#
     .SYNOPSIS
@@ -587,30 +451,13 @@ function New-SessionDerivedTokenProvider {
     return $provider
 }
 
-function New-AuthProvider {
-    <#
-    .SYNOPSIS
-    Factory for the configured auth mode.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Mode
-    )
-
-    switch -Regex ($Mode) {
-        '^OAuth$'          { return New-OAuthProvider }
-        '^SessionDerived$' { return New-SessionDerivedTokenProvider }
-        default { throw "Unsupported AuthMode '$Mode'." }
-    }
-}
-
 function Initialize-AuthProvider {
     <#
     .SYNOPSIS
     Ensures the script-level auth provider exists.
     #>
     if ($null -eq $Script:AuthProvider) {
-        $Script:AuthProvider = New-AuthProvider -Mode $AuthMode
+        $Script:AuthProvider = New-SessionDerivedTokenProvider
     }
 }
 
@@ -642,108 +489,6 @@ function Invoke-AuthRefreshOnce {
         return [bool]$Script:AuthProvider.TryRefreshOnce.Invoke()
     }
     return $false
-}
-
-function Get-AccessToken {
-    <#
-    .SYNOPSIS
-    Obtains OAuth access token using Reddit's password grant or refresh-token grant.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ClientId,
-        [Parameter(Mandatory = $true)]
-        [string]$ClientSecret,
-        [Parameter(Mandatory = $true)]
-        [string]$Username,
-        [SecureString]$Password,
-        [SecureString]$RefreshToken,
-        [string]$UserAgent
-    )
-
-    # Convert SecureString secret(s) to plain text only for this API call.
-    # Prefer refresh-token grant when available to avoid handling account passwords.
-    $plainPassword = $null
-    $plainRefreshToken = $null
-
-    # Reddit requires Basic authentication with client_id:client_secret
-    $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${ClientId}:$ClientSecret"))
-
-    $headers = @{ 'User-Agent' = $UserAgent; Authorization = "Basic $basicAuth" }
-
-    try {
-        $usingRefresh = $null -ne $RefreshToken
-        $usingPassword = $null -ne $Password
-
-        if ($usingRefresh -and $usingPassword) {
-            throw 'Get-AccessToken requires exactly one of -Password or -RefreshToken.'
-        }
-        if (-not $usingRefresh -and -not $usingPassword) {
-            throw 'Get-AccessToken requires one authentication method: -Password or -RefreshToken.'
-        }
-
-        if ($usingRefresh) {
-            $plainRefreshToken = ConvertFrom-SecureStringPlain -Secure $RefreshToken
-            if ([string]::IsNullOrWhiteSpace($plainRefreshToken)) {
-                throw 'RefreshToken was empty.'
-            }
-            $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
-        }
-        else {
-            $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
-            if ([string]::IsNullOrWhiteSpace($plainPassword)) {
-                throw 'Password was empty.'
-            }
-            $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
-        }
-
-        # Request access token from Reddit's OAuth endpoint
-        $resp = Invoke-RestMethod -Method Post -Uri 'https://www.reddit.com/api/v1/access_token' -Headers $headers -Body $body -ErrorAction Stop
-    }
-    finally {
-        # Best-effort: shorten lifetime of managed strings (cannot truly zero a .NET string).
-        $plainPassword = $null
-        $plainRefreshToken = $null
-    }
-
-    # Calculate expiration time with 30-second buffer to ensure we refresh before actual expiry.
-    # Be defensive: expires_in can be missing or non-numeric; default to 3600s in that case.
-    $expiresInSeconds = 3600
-    try {
-        $tmp = 0
-        if ($null -ne $resp -and $resp.PSObject.Properties.Match('expires_in').Count -gt 0 -and [int]::TryParse([string]$resp.expires_in, [ref]$tmp) -and $tmp -gt 0) {
-            $expiresInSeconds = $tmp
-        }
-        elseif ($VerboseLogging) {
-            Write-Verbose "Token response missing/invalid expires_in; defaulting expiry to ${expiresInSeconds}s"
-        }
-    }
-    catch {
-        if ($VerboseLogging) { Write-Verbose "Token response expires_in parsing failed; defaulting expiry to ${expiresInSeconds}s" }
-    }
-
-    $bufferSeconds = 30
-    $effectiveExpiresIn = [Math]::Max($expiresInSeconds - $bufferSeconds, 1)
-    $expiresAt = (Get-Date).ToUniversalTime().AddSeconds($effectiveExpiresIn)
-
-    # Cache token information at script scope for reuse
-    $Script:TokenInfo = [PSCustomObject]@{
-        AccessToken = $resp.access_token
-        TokenType   = $resp.token_type
-        ExpiresAt   = $expiresAt
-    }
-    if ($VerboseLogging) { Write-Verbose "Obtained token, expires at $($expiresAt.ToString('u'))" }
-}
-
-function Confirm-AccessToken {
-    <#
-    .SYNOPSIS
-    Ensures a valid access token exists, refreshing if expired or missing.
-    #>
-    # Check if token is missing or expired; if so, obtain a new one
-    if (-not $Script:TokenInfo -or (Get-Date).ToUniversalTime() -gt $Script:TokenInfo.ExpiresAt) {
-        Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
-    }
 }
 
 function Confirm-AuthenticatedIdentity {
@@ -819,15 +564,6 @@ function Confirm-AuthenticatedIdentity {
     $Script:AuthenticatedUsername = $name
     if ($VerboseLogging) { Write-Verbose "Authenticated as /u/$($Script:AuthenticatedUsername) (verified via /api/v1/me)" }
 
-    # If a username was provided, enforce it matches; otherwise adopt the authenticated username for targeting/reporting.
-    if (-not [string]::IsNullOrWhiteSpace($Username)) {
-        if (-not [string]::Equals($Script:AuthenticatedUsername, $Username, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Authenticated as /u/$($Script:AuthenticatedUsername), but -Username was '$Username'. Refusing to continue to avoid targeting the wrong account or doing a silent no-op."
-        }
-    }
-    else {
-        $script:Username = $Script:AuthenticatedUsername
-    }
 }
 
 function Assert-RedditApiOk {
@@ -1309,7 +1045,6 @@ function Get-CommentsPage {
     if ($AfterToken) { $query.after = $AfterToken }
 
     $targetUser = $Script:AuthenticatedUsername
-    if ([string]::IsNullOrWhiteSpace($targetUser)) { $targetUser = $Username }
     $uri = Build-RedditUri -Path "/user/$targetUser/comments"
     Invoke-RedditRequest -Method Get -Uri $uri -Query $query
 }

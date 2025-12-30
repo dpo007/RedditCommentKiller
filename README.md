@@ -2,14 +2,14 @@
 
 A PowerShell 7 script that finds **your own** Reddit comments older than a chosen age, optionally **overwrites** them first, and then **deletes** them — with rate-limit friendliness, resume support, and a paper trail (CSV report).
 
-It’s basically spring cleaning for your comment history. By default it runs using a session-derived token (single-user), and keeps OAuth support as a fallback. 🧽✨
+It’s basically spring cleaning for your comment history. It runs using a session-derived token from your logged-in Reddit session. 🧽✨
 
-**Auth note (important):** Session-derived token reuse is the primary/default mode. OAuth is supported only as a secondary fallback because Reddit OAuth app approval and long-term reliability can be inconsistent or unavailable for some users.
+**Auth note (important):** Session-derived token reuse only. Why not OAuth? Reddit is axing OAuth API access for regular users, so this script sticks to the session tokens you already have.
 
 ## ✅ What this is
 
 - 🧩 A single-file PowerShell script: `Invoke-RedditCommentDeath.ps1`
-- 🔐 Auth (recommended): session-derived token reuse (default); OAuth still available as a fallback
+- 🔐 Auth: session-derived token reuse (default)
 - 🔎 Scans your user comment listing (newest → oldest)
 - ⏳ Processes comments older than `-DaysOld`
 - ✍️🧼 Optionally overwrites comment text (default) before deleting
@@ -27,12 +27,8 @@ It’s basically spring cleaning for your comment history. By default it runs us
 
 ## 🛡️ Features (aka “the safety rails”)
 
-- 🔑 **Two auth modes (exactly one, default SessionDerived):**
-  - Primary (recommended): session-derived token reuse (`-SessionAccessToken`), single-user only
-  - Secondary (fallback): OAuth with password grant (`-Password`) or refresh-token grant (`-RefreshToken`) plus `-ClientId`/`-ClientSecret`
-
-Why is OAuth “secondary”? In practice, Reddit OAuth app approval and long-term reliability can be inconsistent or unavailable for some users, so session-derived mode is the smoother path when it works for your account.
-- 🧑‍⚖️ **Identity verification:** verifies `/api/v1/me` and (if you supplied `-Username`) enforces that it matches before doing anything destructive.
+- 🔑 **Auth:** session-derived token reuse (`-SessionAccessToken`), single-user only
+- 🧑‍⚖️ **Identity verification:** verifies `/api/v1/me` before doing anything destructive.
 - 🔁 **Resume support:** safe to stop/re-run; it won’t reprocess already handled comments.
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
 - 🧪 **Dry runs:** see what would happen without changing anything.
@@ -42,12 +38,7 @@ Why is OAuth “secondary”? In practice, Reddit OAuth app approval and long-te
 ## 🧾 Requirements
 
 - 🐉 **PowerShell 7+** (the script declares `#requires -Version 7.0`)
-- For the default session-derived mode: a session-derived access token from a logged-in Reddit session (passed securely via `-SessionAccessToken`); `-Username` is optional and will be adopted from `/api/v1/me` if omitted.
-- For OAuth mode (fallback): a Reddit **script app** (client id + secret) and either `-Password` or `-RefreshToken` (not both). `-Username` is optional but recommended; it will be enforced against `/api/v1/me` if supplied.
-- 🧭 OAuth scopes if using OAuth mode:
-  - listing: `identity,history,read`
-  - overwriting: `edit`
-  - deleting: handled by the authenticated API flow used by the script
+- For auth: a session-derived access token from a logged-in Reddit session (passed securely via `-SessionAccessToken`).
 
 ## 🚀 Quick start (primary/default: session-derived)
 
@@ -90,52 +81,13 @@ Then run:
   -ExcludedSubredditsFile "./excluded-subreddits.txt"
 ```
 
-### OAuth quick start (secondary / fallback)
-
-1) Create a Reddit “script” app to get a **Client ID** and **Client Secret**:
-- https://www.reddit.com/prefs/apps
-
-2) Dry run with password grant:
-
-```powershell
-./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
-  -Username "YOUR_USERNAME" `
-  -Password (Read-Host "Password" -AsSecureString) `
-  -DaysOld 90 `
-  -DryRun
-```
-
-3) Real run (password grant):
-
-```powershell
-./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
-  -Username "YOUR_USERNAME" `
-  -Password (Read-Host "Password" -AsSecureString) `
-  -DaysOld 90
-```
-
-4) Prefer a refresh token for repeat runs:
-
-```powershell
-./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
-  -Username "YOUR_USERNAME" `
-  -RefreshToken (Read-Host "Refresh Token" -AsSecureString) `
-  -DaysOld 90
-```
-
 ## 📚 Where the real docs live
 
 For full setup, refresh-token instructions, overwrite modes, rate-limit knobs, resume files, and troubleshooting:
 
 - 👉 See **[UserGuide.md](./UserGuide.md)**
 
-(Yes, it’s longer. Yes, that’s on purpose. The alternative is you learning OAuth by “vibes,” and nobody wants that.)
+(Yes, it’s longer. Yes, that’s on purpose. The alternative is you guessing at Reddit’s auth quirks by “vibes,” and nobody wants that.)
 
 ## 🧾 Outputs
 

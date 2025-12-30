@@ -2,9 +2,8 @@
 
 This guide walks you through setting up and safely running the Reddit comment cleanup script.
 
-**Auth note (important):**  
-The **primary and default authentication method** is **session-derived token reuse** (single-user).  
-OAuth is supported **only as a secondary fallback**, because Reddit OAuth app approval and long-term reliability can be inconsistent or unavailable for some users.
+**Auth note (important):**
+Authentication is **session-derived token reuse only** (single-user). Why not OAuth? Reddit is axing OAuth API access for regular users, so this script sticks to the session tokens you already have.
 
 > **What this script does**
 >
@@ -48,8 +47,6 @@ This is the **default and recommended** way to run the script.
 ### What you provide
 - `-SessionAccessToken` (entered at runtime as a `SecureString`)
 - `-DaysOld`
-- Optional: `-Username`
-  - If omitted, the script automatically adopts the authenticated username from `/api/v1/me`
 
 ---
 
@@ -145,19 +142,7 @@ These steps use **Microsoft Edge**, but the process is similar in other Chromium
 
 ---
 
-## 6) Choose exactly ONE authentication mode
-
-The script enforces **mutual exclusivity**.
-
-- **SessionDerived (default)**  
-  Supply `-SessionAccessToken`
-
-- **OAuth (secondary / fallback)**  
-  Supply `-ClientId`, `-ClientSecret`, and either `-Password` or `-RefreshToken`
-
----
-
-## 7) Decide what gets deleted
+## 6) Decide what gets deleted
 
 Use `-DaysOld` to control the cutoff.
 
@@ -173,7 +158,7 @@ Optional safety buffer:
 
 ---
 
-## 8) Overwrite behavior
+## 7) Overwrite behavior
 
 Default: overwrite then delete.
 
@@ -190,15 +175,15 @@ Overwrite modes:
 
 ---
 
-## 9) Files created
+## 8) Files created
 
-- `reddit_cleanup_state.json` — resume checkpoint  
-- `reddit_cleanup_state.processed_ids.log` — processed IDs  
+- `reddit_cleanup_state.json` — resume checkpoint
+- `reddit_cleanup_state.processed_ids.log` — processed IDs
 - `reddit_cleanup_report.csv` — report
 
 ---
 
-## 10) Resume behavior
+## 9) Resume behavior
 
 Re-run the same command to continue safely.
 
@@ -206,18 +191,7 @@ Delete state files to start fresh.
 
 ---
 
-## 11) OAuth fallback (optional)
-
-Only use if session-derived auth is unavailable.
-
-Includes:
-- App creation
-- Password or refresh-token auth
-- One-time refresh token exchange
-
----
-
-## 12) Scope and limits
+## 10) Scope and limits
 
 - ✅ Your comments
 - ❌ Posts
