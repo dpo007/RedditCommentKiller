@@ -111,3 +111,9 @@ This script can delete a lot of your comment history very quickly.
 ## 📝 License
 
 Not specified (yet). If you want, tell me what license you prefer (MIT/Apache-2.0/GPL-3.0/etc.) and I can add it.
+
+---
+
+## 🕶️ Epilogue
+
+> "No rules are broken. No alarms are triggered. Things simply… disappear."
