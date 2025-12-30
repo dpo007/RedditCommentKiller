@@ -17,8 +17,12 @@ Reddit username to authenticate and target.
 .PARAMETER Password
 Reddit account password as a SecureString. Converted to plain text only for the token request.
 
+Mutually exclusive with -RefreshToken.
+
 .PARAMETER RefreshToken
 OAuth refresh token as a SecureString. If provided, the script will use the refresh-token grant instead of the password grant.
+
+Mutually exclusive with -Password.
 
 .PARAMETER UserAgent
 User-Agent string Reddit requires (e.g. "platform:app:v1 (by /u/yourname)"). If not provided, automatically generated from your username.
@@ -84,6 +88,8 @@ Emit extra diagnostic output.
 ./Invoke-RedditCommentDeath.ps1 -ClientId abc -ClientSecret def -Username myuser -Password (Read-Host "Password" -AsSecureString) -DaysOld 14 -SkipOverwrite
 #>
 
+#requires -Version 7.0
+
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $true)]
@@ -95,7 +101,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Username,
 
-    [Parameter(Mandatory = $true)]
     [SecureString]$Password,
 
     [SecureString]$RefreshToken,
@@ -160,6 +165,18 @@ param(
 
     [switch]$VerboseLogging
 )
+
+# Exactly one of -Password or -RefreshToken must be provided.
+$hasPassword = $PSBoundParameters.ContainsKey('Password') -and $null -ne $Password
+$hasRefreshToken = $PSBoundParameters.ContainsKey('RefreshToken') -and $null -ne $RefreshToken
+
+if ($hasPassword -and $hasRefreshToken) {
+    throw "Specify either -Password or -RefreshToken, not both."
+}
+
+if (-not $hasPassword -and -not $hasRefreshToken) {
+    throw "Specify one authentication method: -Password or -RefreshToken."
+}
 
 # Validate delay range parameters to ensure min <= max
 if ($EditDelaySecondsMax -lt $EditDelaySecondsMin) {
@@ -292,7 +309,6 @@ function Get-AccessToken {
         [string]$ClientSecret,
         [Parameter(Mandatory = $true)]
         [string]$Username,
-        [Parameter(Mandatory = $true)]
         [SecureString]$Password,
         [SecureString]$RefreshToken,
         [string]$UserAgent
@@ -309,19 +325,28 @@ function Get-AccessToken {
     $headers = @{ 'User-Agent' = $UserAgent; Authorization = "Basic $basicAuth" }
 
     try {
-        if ($null -ne $RefreshToken) {
+        $usingRefresh = $null -ne $RefreshToken
+        $usingPassword = $null -ne $Password
+
+        if ($usingRefresh -and $usingPassword) {
+            throw 'Get-AccessToken requires exactly one of -Password or -RefreshToken.'
+        }
+        if (-not $usingRefresh -and -not $usingPassword) {
+            throw 'Get-AccessToken requires one authentication method: -Password or -RefreshToken.'
+        }
+
+        if ($usingRefresh) {
             $plainRefreshToken = ConvertFrom-SecureStringPlain -Secure $RefreshToken
-            if (-not [string]::IsNullOrWhiteSpace($plainRefreshToken)) {
-                $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
+            if ([string]::IsNullOrWhiteSpace($plainRefreshToken)) {
+                throw 'RefreshToken was empty.'
             }
-            else {
-                # If an empty/whitespace refresh token was provided, fall back to password grant.
-                $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
-                $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
-            }
+            $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
         }
         else {
             $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
+            if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+                throw 'Password was empty.'
+            }
             $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
         }
 
