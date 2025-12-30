@@ -1647,7 +1647,7 @@ while ($true) {
                 try {
                     # Reddit's editusertext endpoint requires thing_id and new text
                     $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body -IsWrite -Context $fullname
+                    $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body -IsWrite -Context $fullname
                     $summary.edited++
                     $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                 }
@@ -1680,7 +1680,7 @@ while ($true) {
                 if (-not $DryRun) {
                     try {
                         $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
-                        Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body2 -IsWrite -Context $fullname
+                        $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body2 -IsWrite -Context $fullname
                         $summary.edited++
                         $editStatus = 'edited(2/2)'
                     }
@@ -1705,7 +1705,7 @@ while ($true) {
             try {
                 # Reddit's del endpoint requires the thing's full name
                 $body = @{ api_type = 'json'; id = $fullname }
-                Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/del') -Body $body -IsWrite -Context $fullname
+                $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/del') -Body $body -IsWrite -Context $fullname
                 $summary.deleted++
                 $deleteStatus = 'deleted'
             }
