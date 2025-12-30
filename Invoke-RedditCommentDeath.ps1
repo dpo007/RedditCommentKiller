@@ -500,6 +500,10 @@ function Invoke-RedditApi {
                     }
                 }
                 else {
+                    # AllowNonJsonResponse is intended for endpoints that return empty/opaque bodies, not HTML defenses.
+                    if ($rawContent -match '<!DOCTYPE html|<html') {
+                        throw "Unexpected HTML response from Reddit (possible auth/rate-limit/protection page)."
+                    }
                     $content = $rawContent | ConvertFrom-Json -ErrorAction SilentlyContinue
                 }
             }
@@ -615,6 +619,7 @@ function Invoke-RedditApi {
             else {
                 # Transient non-HTTP failures (DNS/TLS/network/timeouts) can have no Response
                 $shouldRetry = (
+                    $ex -is [Microsoft.PowerShell.Commands.HttpResponseException] -or
                     $ex -is [System.Net.Http.HttpRequestException] -or
                     $ex -is [System.Net.WebException] -or
                     $ex -is [System.TimeoutException] -or
