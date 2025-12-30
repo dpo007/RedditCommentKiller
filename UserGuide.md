@@ -220,6 +220,36 @@ Examples:
 Example:
 - `-DaysOld 90 -SafetyHours 24` means “older than 91 days” effectively.
 
+### Optional: exclude specific subreddits (`-ExcludedSubredditsFile`)
+
+If you want to **skip** comments in certain subreddits (leave them untouched), provide a path to a text file containing subreddit names **one per line**.
+
+Rules:
+- Blank lines are ignored
+- Lines starting with `#` are ignored as comments
+- Each entry may be `subname`, `r/subname`, or `/r/subname` (case-insensitive)
+
+Example file:
+
+```text
+# excluded-subreddits.txt
+AskReddit
+r/SomeSub
+/r/AnotherSub/
+```
+
+Example run:
+
+```powershell
+./Invoke-RedditCommentDeath.ps1 `
+  -ClientId "YOUR_ID" `
+  -ClientSecret "YOUR_SECRET" `
+  -Username "YOUR_USERNAME" `
+  -Password (Read-Host "Password" -AsSecureString) `
+  -DaysOld 90 `
+  -ExcludedSubredditsFile "./excluded-subreddits.txt"
+```
+
 ---
 
 ## 6) Decide whether to overwrite before delete
@@ -378,11 +408,11 @@ This script deliberately slows down to reduce the chance of triggering anti-abus
 
 Controls you can adjust:
 
-- `-BetweenItemsDelayMin` / `-BetweenItemsDelayMax`  
+- `-BetweenItemsDelayMin` / `-BetweenItemsDelayMax`
   Wait between processing comments
-- `-EditDelaySecondsMin` / `-EditDelaySecondsMax`  
+- `-EditDelaySecondsMin` / `-EditDelaySecondsMax`
   Wait between edit and delete for the same comment
-- `-BatchSize` and `-BatchCooldownSeconds`  
+- `-BatchSize` and `-BatchCooldownSeconds`
   Periodic longer pause after batches
 
 Default behavior is conservative and should be safe for long runs.

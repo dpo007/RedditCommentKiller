@@ -69,6 +69,12 @@ Path to checkpoint JSON for resuming.
 .PARAMETER ProcessedLogPath
 Path to an append-only log file containing processed fullnames (one per line). If not provided, it is derived from ResumePath using the same base name.
 
+.PARAMETER ExcludedSubredditsFile
+Optional path to a text file containing subreddit names to exclude (one per line).
+If provided, comments in these subreddits will be skipped (not edited/deleted/reported).
+Blank lines are ignored. Lines starting with # are ignored as comments.
+Entries may be formatted as "subname", "r/subname", or "/r/subname".
+
 .PARAMETER ReportPath
 CSV report output path.
 
@@ -157,6 +163,9 @@ param(
 
     [string]$ProcessedLogPath,
 
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$ExcludedSubredditsFile,
+
     [string]$TwoPassSaltPath,
 
     [string]$ReportPath = './reddit_cleanup_report.csv',
@@ -236,6 +245,29 @@ function ConvertFrom-SecureStringPlain {
         # Always zero and free unmanaged memory for security
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
     }
+}
+
+function Normalize-SubredditName {
+    <#
+    .SYNOPSIS
+    Normalizes subreddit names to a canonical form for comparisons.
+    #>
+    param(
+        [AllowNull()]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Name)) { return $null }
+    $s = ([string]$Name).Trim()
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+
+    $s = $s.Trim('/')
+    if ($s.StartsWith('r/', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $s = $s.Substring(2)
+    }
+    $s = $s.Trim().Trim('/')
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    return $s
 }
 
 function Get-OrCreateTwoPassSalt {
@@ -1030,6 +1062,24 @@ Initialize-ProcessedLog
 $processedSet = [System.Collections.Generic.HashSet[string]]::new()
 Import-ProcessedLog -Set $processedSet
 
+$excludedSubredditsSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if ($PSBoundParameters.ContainsKey('ExcludedSubredditsFile') -and -not [string]::IsNullOrWhiteSpace($ExcludedSubredditsFile)) {
+    foreach ($line in (Get-Content -Path $ExcludedSubredditsFile -ErrorAction Stop)) {
+        $raw = [string]$line
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $trimmed = $raw.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+
+        $normalized = Normalize-SubredditName -Name $trimmed
+        if ($normalized) {
+            $excludedSubredditsSet.Add($normalized) | Out-Null
+        }
+    }
+
+    Write-Host "Loaded $($excludedSubredditsSet.Count) excluded subreddits from $ExcludedSubredditsFile" -ForegroundColor Cyan
+}
+
 # Migrate any legacy `processed` ids stored in the checkpoint into the append-only log (Option B)
 if ($state.processed -and $state.processed.Count -gt 0) {
     $toAppend = [System.Collections.Generic.List[string]]::new()
@@ -1106,12 +1156,22 @@ while ($true) {
 
         $permalink = "https://www.reddit.com$($comment.permalink)"
         $subreddit = $comment.subreddit
+        if ([string]::IsNullOrWhiteSpace([string]$subreddit) -and $comment.PSObject.Properties.Match('subreddit_name_prefixed').Count -gt 0) {
+            $subreddit = $comment.subreddit_name_prefixed
+        }
+        $subredditNormalized = Normalize-SubredditName -Name ([string]$subreddit)
 
         # Listing is newest -> oldest. Skip newer-than-cutoff and keep paging until end.
         if (-not $pastCutoffZone) {
             if ($createdUtc -gt $effectiveCutoffUtc) { continue }
             # We have reached the cutoff zone; all remaining items are older.
             $pastCutoffZone = $true
+        }
+
+        # Optional exclusion: skip comments in excluded subreddits before accounting for paging stop logic.
+        if ($excludedSubredditsSet.Count -gt 0 -and $subredditNormalized -and $excludedSubredditsSet.Contains($subredditNormalized)) {
+            if ($VerboseLogging) { Write-Verbose "Skipping $fullname in excluded subreddit r/$subredditNormalized" }
+            continue
         }
 
         # Once past the cutoff, track per-page older-item stats for stop-optimizations

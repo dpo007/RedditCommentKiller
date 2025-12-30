@@ -33,6 +33,7 @@ It’s basically spring cleaning for your comment history, except the broom is a
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
 - 🧪 **Dry runs:** see what would happen without changing anything.
 - 📊 **CSV report output:** so future-you can answer “what did I do?” without guessing.
+- 🚫 **Exclude subreddits:** optionally skip specific subreddits using `-ExcludedSubredditsFile` (one subreddit name per line).
 
 ## 📦 Requirements
 
@@ -69,6 +70,29 @@ It’s basically spring cleaning for your comment history, except the broom is a
   -Username "YOUR_USERNAME" `
   -Password (Read-Host "Password" -AsSecureString) `
   -DaysOld 90
+```
+
+### 🚫 Exclude specific subreddits
+
+Create a text file (one subreddit per line):
+
+```text
+# excluded-subreddits.txt
+AskReddit
+r/SomeSub
+/r/AnotherSub/
+```
+
+Then run:
+
+```powershell
+./Invoke-RedditCommentDeath.ps1 `
+  -ClientId "YOUR_ID" `
+  -ClientSecret "YOUR_SECRET" `
+  -Username "YOUR_USERNAME" `
+  -Password (Read-Host "Password" -AsSecureString) `
+  -DaysOld 90 `
+  -ExcludedSubredditsFile "./excluded-subreddits.txt"
 ```
 
 4) Prefer a refresh token for repeat runs:
