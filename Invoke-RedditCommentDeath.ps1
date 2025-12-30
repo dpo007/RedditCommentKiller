@@ -299,13 +299,61 @@ if ([string]::IsNullOrWhiteSpace($TwoPassSaltPath)) {
     $TwoPassSaltPath = Join-Path -Path $resumeDir -ChildPath ("$baseName.two_pass_salt.txt")
 }
 
+function ConvertTo-HttpSafeUserAgent {
+    <#
+    .SYNOPSIS
+    Converts a Reddit-style User-Agent (often contains ':') into an HTTP/.NET-safe User-Agent.
+
+    .DESCRIPTION
+    PowerShell's Invoke-WebRequest/Invoke-RestMethod (HttpClient) validates User-Agent as RFC-compliant
+    product tokens (e.g. name/version). Reddit commonly recommends "platform:app:version (by /u/name)",
+    but colons are not valid in product tokens and can throw.
+    #>
+    param(
+        [AllowNull()]
+        [string]$UserAgent
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$UserAgent)) { return $UserAgent }
+    $ua = ([string]$UserAgent).Trim()
+
+    # Preferred input format: platform:app:version (by /u/name)
+    $m = [regex]::Match($ua, '^(?<platform>[^:\s]+):(?<app>[^:\s]+):(?<version>[^\s]+)\s*(?<rest>.*)$')
+    if ($m.Success) {
+        $platform = $m.Groups['platform'].Value
+        $app = $m.Groups['app'].Value
+        $version = $m.Groups['version'].Value
+        $rest = ($m.Groups['rest'].Value ?? '').Trim()
+
+        # Keep the informational "by /u/..." if present, but place it inside an RFC comment.
+        # Example: windows:MyApp:v1.0 (by /u/me) -> MyApp/v1.0 (windows; by /u/me)
+        if ($rest.StartsWith('(') -and $rest.EndsWith(')')) {
+            $rest = $rest.TrimStart('(').TrimEnd(')').Trim()
+        }
+        if ([string]::IsNullOrWhiteSpace($rest)) {
+            return "$app/$version ($platform)"
+        }
+        return "$app/$version ($platform; $rest)"
+    }
+
+    # If the caller already supplied a conventional UA (contains name/version), keep it.
+    if ($ua -match '\S+/\S+') { return $ua }
+
+    # Last-resort: wrap the original as a comment after a known-safe product token.
+    return "RedditCommentKiller/1.0 ($ua)"
+}
+
 # Auto-generate UserAgent if not provided (Reddit API requirement)
 if ([string]::IsNullOrWhiteSpace($UserAgent)) {
     $platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } elseif ($IsLinux) { 'linux' } else { 'unknown' }
     $uaUser = [string]::IsNullOrWhiteSpace($Username) ? 'anonymous' : $Username
-    $UserAgent = "${platform}:RedditCommentKiller:v1.0 (by /u/$uaUser)"
+    # Use an RFC/HttpClient-safe UA by default.
+    $UserAgent = "RedditCommentKiller/1.0 ($platform; by /u/$uaUser)"
     if ($VerboseLogging) { Write-Verbose "Generated UserAgent: $UserAgent" }
 }
+
+# Normalize *any* provided UserAgent to a safe, RFC-compliant format for HttpClient/Invoke-WebRequest.
+$UserAgent = ConvertTo-HttpSafeUserAgent -UserAgent $UserAgent
 
 # Determine whether overwrite phase should run (default true unless -SkipOverwrite is provided)
 $OverwriteEnabled = -not $SkipOverwrite
@@ -924,8 +972,20 @@ function Invoke-RedditRequest {
         # Build provider-supplied auth headers
         $headers = Get-AuthHeadersFromProvider
 
-        # Prepare request parameters; ResponseHeadersVariable captures rate-limit headers
-        $params = @{ Method = $Method; Uri = $Uri; Headers = $headers; ErrorAction = 'Stop'; ResponseHeadersVariable = 'respHeaders' }
+        # Prepare request parameters.
+        # Some PowerShell builds do not support -ResponseHeadersVariable; fall back to resp.Headers.
+        $params = @{ Method = $Method; Uri = $Uri; Headers = $headers; ErrorAction = 'Stop' }
+        $supportsResponseHeadersVariable = $false
+        try {
+            $supportsResponseHeadersVariable = (Get-Command Invoke-WebRequest -ErrorAction Stop).Parameters.ContainsKey('ResponseHeadersVariable')
+        }
+        catch {
+            $supportsResponseHeadersVariable = $false
+        }
+
+        if ($supportsResponseHeadersVariable) {
+            $params.ResponseHeadersVariable = 'respHeaders'
+        }
         if ($Body) {
             $params.Body = $Body
             $params.ContentType = 'application/x-www-form-urlencoded'
@@ -933,17 +993,35 @@ function Invoke-RedditRequest {
 
         # Build query string with proper URL encoding if query parameters provided
         if ($Query) {
-            $qs = ($Query.GetEnumerator() | ForEach-Object {
-                    "{0}={1}" -f [uri]::EscapeDataString($_.Key),
-                    [uri]::EscapeDataString([string]$_.Value)
-                }) -join '&'
+            $pairs = foreach ($entry in $Query.GetEnumerator()) {
+                $k = [string]$entry.Key
+                if ([string]::IsNullOrWhiteSpace($k)) { continue }
+
+                $v = $entry.Value
+                if ($null -eq $v) { continue }
+
+                $kEsc = [uri]::EscapeDataString($k)
+                $vEsc = [uri]::EscapeDataString([string]$v)
+                "{0}={1}" -f $kEsc, $vEsc
+            }
+
+            $qs = ($pairs -join '&')
 
             if ($qs) {
-                $params.Uri = "$Uri?$qs"
+                $params.Uri = "$($Uri)?$qs"
             }
             else {
                 $params.Uri = $Uri
             }
+        }
+
+        # Fail early with a clear message if we built a malformed URI.
+        try {
+            [void][System.Uri]::new([string]$params.Uri)
+        }
+        catch {
+            $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
+            throw "Built invalid URI$ctx for ${Method}: '$($params.Uri)'. $($_.Exception.Message)"
         }
 
         try {
@@ -952,6 +1030,42 @@ function Invoke-RedditRequest {
 
             # Execute the HTTP request
             $resp = Invoke-WebRequest @params
+
+            # Normalize headers to a simple hashtable with lower-cased keys.
+            if (-not $supportsResponseHeadersVariable) {
+                $respHeaders = @{}
+                try {
+                    if ($resp -and $resp.PSObject.Properties.Match('Headers').Count -gt 0 -and $resp.Headers) {
+                        $h = $resp.Headers
+
+                        # Common case: IDictionary
+                        if ($h -is [System.Collections.IDictionary]) {
+                            foreach ($k in $h.Keys) {
+                                if ($null -eq $k) { continue }
+                                $key = ([string]$k).ToLowerInvariant()
+                                $respHeaders[$key] = $h[$k]
+                            }
+                        }
+                        else {
+                            # Best-effort enumerator support
+                            $enum = $null
+                            try { $enum = $h.GetEnumerator() } catch { $enum = $null }
+                            if ($enum) {
+                                foreach ($entry in $enum) {
+                                    if ($null -eq $entry) { continue }
+                                    $key = ([string]$entry.Key).ToLowerInvariant()
+                                    $respHeaders[$key] = $entry.Value
+                                }
+                            }
+                        }
+                    }
+                }
+                catch {
+                    # If we cannot read headers, leave empty and proceed (rate-limit logic becomes conservative).
+                    $respHeaders = @{}
+                }
+            }
+
             $content = $null
             $rawContent = $resp.Content
             $parseError = $null
@@ -1238,17 +1352,36 @@ function Import-ProcessedLog {
     Loads processed IDs from the append-only log into a HashSet.
     #>
     param(
-        [Parameter(Mandatory = $true)]
         [System.Collections.Generic.HashSet[string]]$Set
     )
 
-    if (-not (Test-Path $ProcessedLogPath)) { return }
+    if ($null -eq $Set) {
+        $Set = [System.Collections.Generic.HashSet[string]]::new()
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$ProcessedLogPath)) {
+        Write-Output -NoEnumerate $Set
+        return
+    }
+
+    try {
+        if (-not (Test-Path -Path $ProcessedLogPath)) {
+            Write-Output -NoEnumerate $Set
+            return
+        }
+    }
+    catch {
+        Write-Output -NoEnumerate $Set
+        return
+    }
 
     foreach ($line in (Get-Content -Path $ProcessedLogPath -ErrorAction SilentlyContinue)) {
         $id = [string]$line
         if ([string]::IsNullOrWhiteSpace($id)) { continue }
         $Set.Add($id.Trim()) | Out-Null
     }
+
+    Write-Output -NoEnumerate $Set
 }
 
 function Add-ProcessedIds {
@@ -1357,8 +1490,10 @@ $state = Import-Checkpoint
 # Ensure processed-id log exists and load it into a HashSet for O(1) lookups
 Initialize-ProcessedLog
 
-$processedSet = [System.Collections.Generic.HashSet[string]]::new()
-Import-ProcessedLog -Set $processedSet
+$processedSet = Import-ProcessedLog
+if ($null -eq $processedSet) {
+    $processedSet = [System.Collections.Generic.HashSet[string]]::new()
+}
 
 $excludedSubredditsSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if ($PSBoundParameters.ContainsKey('ExcludedSubredditsFile') -and -not [string]::IsNullOrWhiteSpace($ExcludedSubredditsFile)) {
