@@ -86,7 +86,7 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 For full setup, refresh-token instructions, overwrite modes, rate-limit knobs, resume files, and troubleshooting:
 
-- 👉 See **`UserGuide.md`**
+- 👉 See **[UserGuide.md](./UserGuide.md)**
 
 (Yes, it’s longer. Yes, that’s on purpose. The alternative is you learning OAuth by “vibes,” and nobody wants that.)
 
