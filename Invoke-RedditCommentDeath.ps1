@@ -108,19 +108,24 @@ param(
 
     [string]$SessionSecretName,
 
+    # Additional safety margin (hours). Shifts the effective cutoff older than -DaysOld.
     [ValidateRange(0, 720)]
     [int]$SafetyHours = 0,
 
     [switch]$SkipOverwrite,
 
+    # Optional stop optimization: end pagination once pages beyond cutoff are mostly already processed.
     [switch]$EnableMostlyProcessedStop,
 
+    # Stop after N consecutive mostly-processed pages.
     [ValidateRange(1, 100)]
     [int]$MostlyProcessedConsecutivePages = 3,
 
+    # Treat a page as mostly processed when (unprocessed/olderTotal) <= this ratio.
     [ValidateRange(0.0, 1.0)]
     [double]$MostlyProcessedRatioThreshold = 0.02,
 
+    # Additional guard: require unprocessed older items on page <= this number.
     [ValidateRange(0, 1000)]
     [int]$MostlyProcessedMaxUnprocessedPerPage = 2,
 
@@ -129,6 +134,7 @@ param(
 
     [string]$FixedOverwriteText = '[deleted]',
 
+    # Probability that an eligible comment uses a two-pass overwrite (edit A -> wait -> edit B -> wait -> delete).
     [ValidateRange(0.0, 1.0)]
     [double]$TwoPassProbability = 0.0,
 
@@ -150,19 +156,23 @@ param(
     [ValidateRange(1, 86400)]
     [int]$BatchCooldownSeconds = 600,
 
+    # Checkpoint state file (cursor) so runs can resume.
     [string]$ResumePath = './reddit_cleanup_state.json',
 
+    # Append-only processed-id log to avoid reprocessing across runs (derived from ResumePath if omitted).
     [string]$ProcessedLogPath,
 
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
     [string]$ExcludedSubredditsFile,
 
+    # Salt file used to make two-pass selection stable across runs (derived from ResumePath if omitted).
     [string]$TwoPassSaltPath,
 
     [string]$ReportPath = './reddit_cleanup_report.csv',
 
     [switch]$DryRun,
 
+    # Enables extra diagnostic output via Write-Verbose.
     [switch]$VerboseLogging
 )
 
@@ -1200,6 +1210,14 @@ function ConvertTo-SafeCsvCell {
 }
 
 function ConvertTo-SingleLineText {
+    <#
+    .SYNOPSIS
+    Normalizes text to a single-line, human-readable snippet.
+
+    .DESCRIPTION
+    Collapses all whitespace to single spaces, trims ends, and optionally truncates
+    with an ellipsis. Used for safe console/report display (not for Reddit API writes).
+    #>
     param(
         [AllowNull()]
         [string]$Text,
@@ -1209,8 +1227,10 @@ function ConvertTo-SingleLineText {
     )
 
     if ($null -eq $Text) { return '' }
+    # Collapse all whitespace/newlines into single spaces.
     $t = ([string]$Text) -replace '\s+', ' '
     $t = $t.Trim()
+    # Keep titles/labels short for display and CSV readability.
     if ($t.Length -gt $MaxLength) {
         return $t.Substring(0, $MaxLength - 1) + '…'
     }
@@ -1286,11 +1306,13 @@ $effectiveCutoffUtc = $cutoffUtc.AddHours(-1 * $SafetyHours)
 # Load checkpoint to resume from previous run if interrupted
 $state = Import-Checkpoint
 
-# Ensure processed-id log exists and load it into a HashSet for O(1) lookups
+# Ensure processed-id log exists and load it into a HashSet for O(1) membership checks
 Initialize-ProcessedLog
 
+# Import the append-only processed-id log (if present). This is the primary resume mechanism.
 $processedSet = Import-ProcessedLog
 if ($null -eq $processedSet) {
+    # Defensive fallback: Import-ProcessedLog should always return a HashSet.
     $processedSet = [System.Collections.Generic.HashSet[string]]::new()
 }
 
@@ -1299,6 +1321,8 @@ $processedCount = $processedSet.Count
 
 $excludedSubredditsSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if ($PSBoundParameters.ContainsKey('ExcludedSubredditsFile') -and -not [string]::IsNullOrWhiteSpace($ExcludedSubredditsFile)) {
+    # Read and normalize exclusions from a simple line-based file.
+    # Supported formats: subname, r/subname, /r/subname. Blank lines and # comments are ignored.
     foreach ($line in (Get-Content -Path $ExcludedSubredditsFile -ErrorAction Stop)) {
         $raw = [string]$line
         if ([string]::IsNullOrWhiteSpace($raw)) { continue }
@@ -1359,6 +1383,9 @@ $consecutiveMostlyProcessedPages = 0
 
 # Resume from saved pagination token if available
 $after = $state.after
+
+# Once we encounter the first comment older than cutoff, we're in the “cutoff zone” and can
+# start applying stop-optimizations based on how many older items are already processed.
 $pastCutoffZone = $false
 
 if ($SafetyHours -gt 0) {
@@ -1382,6 +1409,9 @@ while ($true) {
 
     $pageOlderTotal = 0
     $pageOlderUnprocessed = 0
+
+    # Per-page stats are only counted for items older than the cutoff (after $pastCutoffZone becomes true).
+    # They are used to stop early when the remaining older items are already processed.
 
     # Process each comment in the current page
     foreach ($child in $children) {
