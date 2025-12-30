@@ -508,6 +508,25 @@ function Invoke-RedditApi {
                 }
             }
 
+            # For write endpoints that allow non-JSON bodies, ensure we still got a success status.
+            $statusCode = $null
+            try {
+                if ($resp.PSObject.Properties.Match('StatusCode').Count -gt 0 -and $null -ne $resp.StatusCode) {
+                    $statusCode = [int]$resp.StatusCode
+                }
+                elseif ($resp.StatusCode -and $null -ne $resp.StatusCode.value__) {
+                    $statusCode = [int]$resp.StatusCode.value__
+                }
+            }
+            catch {
+                $statusCode = $null
+            }
+
+            if ($IsWrite -and $AllowNonJsonResponse -and $null -ne $statusCode -and $statusCode -ne 200 -and $statusCode -ne 204) {
+                $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
+                throw "Unexpected status code $statusCode for $Method $Uri$ctx (expected 200/204)."
+            }
+
             if ($VerboseLogging) { Write-Verbose "API $Method $Uri status $($resp.StatusCode) attempt $attempt" }
 
             # Check Reddit's documented rate-limit headers (treat as authoritative when present)
@@ -562,8 +581,23 @@ function Invoke-RedditApi {
                 try {
                     $raRaw = $null
 
-                    if ($resp.PSObject.Properties.Match('Headers').Count -gt 0 -and $resp.Headers) {
-                        # HttpResponseMessage: Headers can expose RetryAfter as a structured value
+                    if ($resp -is [System.Net.Http.HttpResponseMessage]) {
+                        $values = $null
+                        if ($resp.Headers.TryGetValues('Retry-After', [ref]$values)) {
+                            $raRaw = @($values) | Select-Object -First 1
+                        }
+                        elseif ($resp.Headers.RetryAfter) {
+                            if ($resp.Headers.RetryAfter.Delta) {
+                                $retryAfterSeconds = [int][math]::Ceiling($resp.Headers.RetryAfter.Delta.TotalSeconds)
+                            }
+                            elseif ($resp.Headers.RetryAfter.Date) {
+                                $until = $resp.Headers.RetryAfter.Date.UtcDateTime - (Get-Date).ToUniversalTime()
+                                $retryAfterSeconds = [int][math]::Ceiling($until.TotalSeconds)
+                            }
+                        }
+                    }
+                    elseif ($resp.PSObject.Properties.Match('Headers').Count -gt 0 -and $resp.Headers) {
+                        # Other response shapes; fall back to Headers property access
                         if ($resp.Headers.PSObject.Properties.Match('RetryAfter').Count -gt 0 -and $resp.Headers.RetryAfter) {
                             if ($resp.Headers.RetryAfter.Delta) {
                                 $retryAfterSeconds = [int][math]::Ceiling($resp.Headers.RetryAfter.Delta.TotalSeconds)
@@ -878,6 +912,8 @@ while ($true) {
 
         # Extract comment identifiers and metadata
         $fullname = $comment.name  # Reddit's full thing ID (e.g., "t1_abc123")
+        if ([string]::IsNullOrWhiteSpace($fullname)) { continue }
+
         $permalink = "https://www.reddit.com$($comment.permalink)"
         $subreddit = $comment.subreddit
 
@@ -894,13 +930,13 @@ while ($true) {
         # Skip if already processed in previous run (resume functionality)
         if ($processedSet.Contains($fullname)) { continue }
 
+        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
+
         $summary.matched++
         $actionDesc = "comment $fullname"
 
         # Honor -WhatIf parameter (CmdletBinding SupportsShouldProcess)
         if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) { continue }
-
-        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
 
         # Initialize tracking variables for this comment's processing
         $overwriteText = $null
