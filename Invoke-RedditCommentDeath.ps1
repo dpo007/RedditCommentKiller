@@ -173,7 +173,10 @@ param(
     [switch]$DryRun,
 
     # Enables extra diagnostic output via Write-Verbose.
-    [switch]$VerboseLogging
+    [switch]$VerboseLogging,
+
+    # Suppress progress indicators during waits.
+    [switch]$NoProgress
 )
 
 # Validate required session-derived auth inputs
@@ -426,9 +429,9 @@ function New-SessionDerivedTokenProvider {
     }
 
     $Script:SessionTokenInfo = [PSCustomObject]@{
-        Token  = $token
-        Scheme = $SessionAuthorizationScheme
-        Source = $SessionSecretName
+        Token      = $token
+        Scheme     = $SessionAuthorizationScheme
+        Source     = $SessionSecretName
         ApiBaseUri = $SessionApiBaseUri
     }
 
@@ -612,6 +615,43 @@ function Get-RandomDelay {
     if ($MaxSeconds -le $MinSeconds) { return $MinSeconds }
     # Get-Random's -Maximum is exclusive, so add 1 to include MaxSeconds
     Get-Random -Minimum $MinSeconds -Maximum ($MaxSeconds + 1)
+}
+
+function Wait-WithProgress {
+    <#
+    .SYNOPSIS
+    Waits with an optional countdown progress bar.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [double]$Seconds,
+
+        [string]$Activity = 'Waiting',
+
+        [string]$Status,
+
+        [int]$Id = 1,
+
+        [switch]$NoProgress
+    )
+
+    $total = [int][Math]::Ceiling([double]$Seconds)
+    if ($total -le 0) { return }
+
+    if ($NoProgress -or $ProgressPreference -eq 'SilentlyContinue' -or $total -lt 3) {
+        Start-Sleep -Seconds $total
+        return
+    }
+
+    for ($elapsed = 0; $elapsed -lt $total; $elapsed++) {
+        $remaining = $total - $elapsed
+        $percent = [int][Math]::Floor(($elapsed / [double]$total) * 100)
+        $statusText = if ([string]::IsNullOrWhiteSpace($Status)) { "Waiting $remaining s" } else { "$Status ($remaining s remaining)" }
+        Write-Progress -Id $Id -Activity $Activity -Status $statusText -PercentComplete $percent
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Progress -Id $Id -Activity $Activity -Completed
 }
 
 function Get-OverwriteText {
@@ -894,7 +934,7 @@ function Invoke-RedditRequest {
                 if ($parsedRemaining -and $parsedReset -and $remaining -lt 3 -and $reset -gt 0) {
                     $sleepFor = [math]::Ceiling($reset)
                     Write-Warning "Rate limit low (remaining=$remaining); sleeping $sleepFor seconds"
-                    Start-Sleep -Seconds $sleepFor
+                    Wait-WithProgress -Seconds $sleepFor -Activity 'Reddit rate limit' -Status "Cooling down (remaining=$remaining)" -NoProgress:$NoProgress
                 }
             }
 
@@ -1028,7 +1068,7 @@ function Invoke-RedditRequest {
                 $reason = ($null -ne $status) ? "status $statusLabel" : "non-HTTP failure: $($ex.Message)"
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
                 Write-Warning "API call failed$ctx ($reason); retrying in $delay s (attempt $attempt of $maxAttempts)"
-                Start-Sleep -Seconds $delay
+                Wait-WithProgress -Seconds $delay -Activity 'Retry backoff' -Status "Attempt $attempt of $maxAttempts ($reason)" -NoProgress:$NoProgress
 
                 # Double backoff for next retry, capped at 60 seconds
                 $backoff = [Math]::Min($backoff * 2, 60)
@@ -1533,7 +1573,7 @@ while ($true) {
 
             # Randomized delay between overwrite passes / before delete to appear more human
             $sleep = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
-            if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
+            if ($sleep -gt 0) { Wait-WithProgress -Seconds $sleep -Activity 'Pause before delete' -Status 'Spacing edits and deletes' -NoProgress:$NoProgress }
 
             # Optional second overwrite pass for a stable-random subset of comments
             if ($doTwoPass) {
@@ -1564,7 +1604,7 @@ while ($true) {
                 }
 
                 $sleep2 = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
-                if ($sleep2 -gt 0) { Start-Sleep -Seconds $sleep2 }
+                if ($sleep2 -gt 0) { Wait-WithProgress -Seconds $sleep2 -Activity 'Pause before second edit' -Status 'Spacing edits' -NoProgress:$NoProgress }
             }
         }
 
@@ -1591,12 +1631,12 @@ while ($true) {
         # Record this comment's processing result in CSV report
         Add-ReportRow ([PSCustomObject]@{
                 created_utc = $createdUtc.ToString('u')
-            permalink   = ConvertTo-SafeCsvCell -Value $permalink
-            subreddit   = ConvertTo-SafeCsvCell -Value ([string]$subreddit)
-            fullname    = ConvertTo-SafeCsvCell -Value $fullname
+                permalink   = ConvertTo-SafeCsvCell -Value $permalink
+                subreddit   = ConvertTo-SafeCsvCell -Value ([string]$subreddit)
+                fullname    = ConvertTo-SafeCsvCell -Value $fullname
                 action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
-            status      = ConvertTo-SafeCsvCell -Value "$editStatus/$deleteStatus"
-            error       = ConvertTo-SafeCsvCell -Value $errorMessage
+                status      = ConvertTo-SafeCsvCell -Value "$editStatus/$deleteStatus"
+                error       = ConvertTo-SafeCsvCell -Value $errorMessage
             })
 
         # Mark as processed to avoid reprocessing on resume
@@ -1619,12 +1659,12 @@ while ($true) {
 
         # Enforce minimum 2-second delay for write operations (Reddit best practice)
         if ($sleepBetween -lt 2 -and $didWrite) { $sleepBetween = 2 }
-        if ($sleepBetween -gt 0) { Start-Sleep -Seconds $sleepBetween }
+        if ($sleepBetween -gt 0) { Wait-WithProgress -Seconds $sleepBetween -Activity 'Between items cooldown' -Status 'Spacing requests' -NoProgress:$NoProgress }
 
         # Batch cooldown: pause after processing BatchSize items to stay well under rate limits
         if ($batchCount -ge $BatchSize) {
             Write-Host "Batch of $batchCount completed; cooling down for $BatchCooldownSeconds seconds" -ForegroundColor Yellow
-            Start-Sleep -Seconds $BatchCooldownSeconds
+            Wait-WithProgress -Seconds $BatchCooldownSeconds -Activity 'Batch cooldown' -Status "Pausing after $batchCount items" -NoProgress:$NoProgress
             $batchCount = 0
         }
 
