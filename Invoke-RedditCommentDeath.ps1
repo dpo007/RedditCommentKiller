@@ -306,9 +306,16 @@ function Get-AccessToken {
     $headers = @{ 'User-Agent' = $UserAgent; Authorization = "Basic $basicAuth" }
 
     try {
-        if ($RefreshToken -and $RefreshToken.Length -gt 0) {
+        if ($null -ne $RefreshToken) {
             $plainRefreshToken = ConvertFrom-SecureStringPlain -Secure $RefreshToken
-            $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
+            if (-not [string]::IsNullOrWhiteSpace($plainRefreshToken)) {
+                $body = @{ grant_type = 'refresh_token'; refresh_token = $plainRefreshToken }
+            }
+            else {
+                # If an empty/whitespace refresh token was provided, fall back to password grant.
+                $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
+                $body = @{ grant_type = 'password'; username = $Username; password = $plainPassword }
+            }
         }
         else {
             $plainPassword = ConvertFrom-SecureStringPlain -Secure $Password
@@ -878,7 +885,7 @@ function ConvertTo-SafeCsvCell {
         [string]$Value
     )
     if ($null -eq $Value) { return '' }
-    if ($Value.Length -gt 0 -and $Value[0] -match '^[=\+\-@]') { return "'$Value" }
+    if ($Value -match '^[=\+\-@]') { return "'$Value" }
     return $Value
 }
 
