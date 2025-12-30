@@ -26,8 +26,8 @@ It’s basically spring cleaning for your comment history, except the broom is a
 ## 🛡️ Features (aka “the safety rails”)
 
 - 🔑 **Two auth modes (exactly one):**
-  - password grant (`-Password`) for quick runs
-  - refresh-token grant (`-RefreshToken`) for repeatable runs without typing your password
+  - OAuth: password grant (`-Password`) or refresh-token grant (`-RefreshToken`)
+  - Session-derived token reuse (`-AuthMode SessionDerived` + `-SessionAccessToken`), single-user only
 - 🧑‍⚖️ **Identity verification:** confirms `/api/v1/me` matches `-Username` before doing anything destructive.
 - 🔁 **Resume support:** safe to stop/re-run; it won’t reprocess already handled comments.
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
@@ -105,6 +105,14 @@ Then run:
   -RefreshToken (Read-Host "Refresh Token" -AsSecureString) `
   -DaysOld 90
 ```
+
+### 🧪 Session-derived mode (advanced, single-user)
+
+- Switch auth mode: `-AuthMode SessionDerived`
+- Provide a session-derived token securely: `-SessionAccessToken (Read-Host "Session token" -AsSecureString)`
+- Optional: `-SessionApiBaseUri` if your token expects a different base; `-SessionAuthorizationScheme` if the scheme is not `bearer`.
+- Treat the token as highly sensitive; do not log it and prefer OS-protected secret storage if you cache it externally.
+- Session reuse may be against Reddit’s terms and can trigger account enforcement. Use interactively, at low volume, and stop if you see challenges/HTML defenses.
 
 ## 📚 Where the real docs live
 

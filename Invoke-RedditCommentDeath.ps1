@@ -6,23 +6,38 @@ Deletes your own Reddit comments older than a chosen age, optionally overwriting
 PowerShell 7 script that authenticates to Reddit using a script app (personal use) via the resource owner password flow. It scans your comments, overwrites them for privacy (optional), and deletes them while respecting rate limits and offering resume/retry and reporting.
 
 .PARAMETER ClientId
-Reddit app client_id (personal use script app).
+Reddit app client_id (personal use script app). Required when -AuthMode OAuth.
 
 .PARAMETER ClientSecret
-Reddit app client_secret.
+Reddit app client_secret. Required when -AuthMode OAuth.
 
 .PARAMETER Username
 Reddit username to authenticate and target.
 
+.PARAMETER AuthMode
+Selects the authentication provider: OAuth (default) or SessionDerived (session-derived token reuse).
+
 .PARAMETER Password
-Reddit account password as a SecureString. Converted to plain text only for the token request.
+Reddit account password as a SecureString. Converted to plain text only for the token request (OAuth mode only).
 
 Mutually exclusive with -RefreshToken.
 
 .PARAMETER RefreshToken
-OAuth refresh token as a SecureString. If provided, the script will use the refresh-token grant instead of the password grant.
+OAuth refresh token as a SecureString. If provided, the script will use the refresh-token grant instead of the password grant (OAuth mode only).
 
 Mutually exclusive with -Password.
+
+.PARAMETER SessionAccessToken
+Session-derived access token as a SecureString (e.g., bearer-style token derived from a signed-in browser session). Never logged; kept in-memory.
+
+.PARAMETER SessionApiBaseUri
+API base URI to use when -AuthMode SessionDerived (default: https://oauth.reddit.com).
+
+.PARAMETER SessionAuthorizationScheme
+Authorization scheme/prefix to pair with the session-derived token (default: bearer).
+
+.PARAMETER SessionSecretName
+Optional label/secret-name metadata for the session-derived token source (not stored). Useful if integrating with an OS-protected secret store externally.
 
 .PARAMETER UserAgent
 User-Agent string Reddit requires (e.g. "platform:app:v1 (by /u/yourname)"). If not provided, automatically generated from your username.
@@ -98,18 +113,29 @@ Emit extra diagnostic output.
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter()]
     [string]$ClientId,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter()]
     [string]$ClientSecret,
 
     [Parameter(Mandatory = $true)]
     [string]$Username,
 
+    [ValidateSet('OAuth', 'SessionDerived')]
+    [string]$AuthMode = 'OAuth',
+
     [SecureString]$Password,
 
     [SecureString]$RefreshToken,
+
+    [SecureString]$SessionAccessToken,
+
+    [string]$SessionApiBaseUri = 'https://oauth.reddit.com',
+
+    [string]$SessionAuthorizationScheme = 'bearer',
+
+    [string]$SessionSecretName,
 
     [string]$UserAgent,
 
@@ -175,16 +201,45 @@ param(
     [switch]$VerboseLogging
 )
 
-# Exactly one of -Password or -RefreshToken must be provided.
+$usingOAuth = [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)
+$usingSessionDerived = [string]::Equals($AuthMode, 'SessionDerived', [System.StringComparison]::OrdinalIgnoreCase)
+
 $hasPassword = $PSBoundParameters.ContainsKey('Password') -and $null -ne $Password
 $hasRefreshToken = $PSBoundParameters.ContainsKey('RefreshToken') -and $null -ne $RefreshToken
+$hasSessionToken = $PSBoundParameters.ContainsKey('SessionAccessToken') -and $null -ne $SessionAccessToken
 
-if ($hasPassword -and $hasRefreshToken) {
-    throw "Specify either -Password or -RefreshToken, not both."
+if (-not ($usingOAuth -xor $usingSessionDerived)) {
+    throw "AuthMode must be either 'OAuth' or 'SessionDerived'."
 }
 
-if (-not $hasPassword -and -not $hasRefreshToken) {
-    throw "Specify one authentication method: -Password or -RefreshToken."
+if ($usingOAuth) {
+    if ([string]::IsNullOrWhiteSpace($ClientId)) { throw "-ClientId is required when -AuthMode OAuth." }
+    if ([string]::IsNullOrWhiteSpace($ClientSecret)) { throw "-ClientSecret is required when -AuthMode OAuth." }
+
+    if ($hasPassword -and $hasRefreshToken) {
+        throw "Specify either -Password or -RefreshToken, not both, when -AuthMode OAuth."
+    }
+
+    if (-not $hasPassword -and -not $hasRefreshToken) {
+        throw "Specify one authentication method (-Password or -RefreshToken) when -AuthMode OAuth."
+    }
+}
+else {
+    if (-not $hasSessionToken) {
+        throw "SessionDerived mode requires -SessionAccessToken (SecureString)."
+    }
+
+    if ($hasPassword -or $hasRefreshToken) {
+        throw "-Password and -RefreshToken are not used with -AuthMode SessionDerived; omit them to avoid accidental mixing of auth modes."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SessionApiBaseUri)) {
+        throw "-SessionApiBaseUri cannot be empty when -AuthMode SessionDerived."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SessionAuthorizationScheme)) {
+        throw "-SessionAuthorizationScheme cannot be empty when -AuthMode SessionDerived."
+    }
 }
 
 # Validate delay range parameters to ensure min <= max
@@ -324,10 +379,193 @@ $Script:TokenInfo = $null
 # Script-level variable to store verified authenticated username (from /api/v1/me)
 $Script:AuthenticatedUsername = $null
 
+# Script-level variable to store session-derived token details (kept in-memory only)
+$Script:SessionTokenInfo = $null
+
+# Script-level variable to hold the active auth provider instance
+$Script:AuthProvider = $null
+
 # Minimum spacing between Reddit API calls (fallback for endpoints that omit rate-limit headers).
 # Reddit's published free-access guidance is ~100 queries/minute (~0.6s per request).
 $Script:RedditApiMinRequestIntervalSeconds = 0.6
 $Script:RedditApiLastRequestAtUtc = $null
+
+function Test-IsHtmlContent {
+    <#
+    .SYNOPSIS
+    Detects whether a response body appears to be HTML (challenge/defense page).
+    #>
+    param(
+        [AllowNull()]
+        [string]$Content
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Content)) { return $false }
+    $trimmed = ([string]$Content).Trim()
+    return ($trimmed -match '<!DOCTYPE html|<html')
+}
+
+function Build-RedditUri {
+    <#
+    .SYNOPSIS
+    Combines the provider's base URI with a relative path.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Ensure-AuthProviderInitialized
+
+    $base = $null
+    if ($Script:AuthProvider -and $Script:AuthProvider.PSObject.Properties.Match('ApiBaseUri').Count -gt 0) {
+        $base = [string]$Script:AuthProvider.ApiBaseUri
+    }
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'https://oauth.reddit.com' }
+
+    $normalizedPath = $Path
+    if (-not $normalizedPath.StartsWith('/')) { $normalizedPath = "/$normalizedPath" }
+    return ($base.TrimEnd('/') + $normalizedPath)
+}
+
+function New-OAuthProvider {
+    <#
+    .SYNOPSIS
+    Creates an OAuth-backed auth provider that reuses the existing token flow.
+    #>
+    $provider = [PSCustomObject]@{
+        Name            = 'OAuth'
+        ApiBaseUri      = 'https://oauth.reddit.com'
+        SupportsRefresh = $true
+    }
+
+    $provider | Add-Member -MemberType ScriptMethod -Name EnsureValidAuth -Value {
+        Confirm-AccessToken
+        if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
+            throw 'Access token missing after Confirm-AccessToken.'
+        }
+    } -Force
+
+    $provider | Add-Member -MemberType ScriptMethod -Name GetAuthHeaders -Value {
+        if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
+            throw 'Access token missing when building headers.'
+        }
+        return @{ 'Authorization' = "bearer $($Script:TokenInfo.AccessToken)"; 'User-Agent' = $UserAgent }
+    } -Force
+
+    $provider | Add-Member -MemberType ScriptMethod -Name TryRefreshOnce -Value {
+        Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
+        return $true
+    } -Force
+
+    return $provider
+}
+
+function New-SessionDerivedTokenProvider {
+    <#
+    .SYNOPSIS
+    Creates a session-derived-token provider (token stays in-memory only).
+    #>
+    $token = $null
+    if ($SessionAccessToken) {
+        $token = ConvertFrom-SecureStringPlain -Secure $SessionAccessToken
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$token)) {
+        throw 'SessionDerived auth requires a non-empty session-derived token.'
+    }
+
+    $Script:SessionTokenInfo = [PSCustomObject]@{
+        Token  = $token
+        Scheme = $SessionAuthorizationScheme
+        Source = $SessionSecretName
+        ApiBaseUri = $SessionApiBaseUri
+    }
+
+    $provider = [PSCustomObject]@{
+        Name            = 'SessionDerived'
+        ApiBaseUri      = $SessionApiBaseUri
+        SupportsRefresh = $false
+    }
+
+    $provider | Add-Member -MemberType ScriptMethod -Name EnsureValidAuth -Value {
+        if (-not $Script:SessionTokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:SessionTokenInfo.Token)) {
+            throw 'Session-derived token missing.'
+        }
+    } -Force
+
+    $provider | Add-Member -MemberType ScriptMethod -Name GetAuthHeaders -Value {
+        if (-not $Script:SessionTokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:SessionTokenInfo.Token)) {
+            throw 'Session-derived token missing when building headers.'
+        }
+        $scheme = [string]$Script:SessionTokenInfo.Scheme
+        if ([string]::IsNullOrWhiteSpace($scheme)) { $scheme = 'bearer' }
+        return @{ 'Authorization' = "$scheme $($Script:SessionTokenInfo.Token)"; 'User-Agent' = $UserAgent }
+    } -Force
+
+    $provider | Add-Member -MemberType ScriptMethod -Name TryRefreshOnce -Value {
+        # Session-derived tokens are assumed non-refreshable; caller should stop on auth failures.
+        return $false
+    } -Force
+
+    return $provider
+}
+
+function New-AuthProvider {
+    <#
+    .SYNOPSIS
+    Factory for the configured auth mode.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Mode
+    )
+
+    switch -Regex ($Mode) {
+        '^OAuth$'          { return New-OAuthProvider }
+        '^SessionDerived$' { return New-SessionDerivedTokenProvider }
+        default { throw "Unsupported AuthMode '$Mode'." }
+    }
+}
+
+function Ensure-AuthProviderInitialized {
+    <#
+    .SYNOPSIS
+    Ensures the script-level auth provider exists.
+    #>
+    if ($null -eq $Script:AuthProvider) {
+        $Script:AuthProvider = New-AuthProvider -Mode $AuthMode
+    }
+}
+
+function Ensure-AuthIsReady {
+    <#
+    .SYNOPSIS
+    Ensures the provider has valid auth state before a request.
+    #>
+    Ensure-AuthProviderInitialized
+    $Script:AuthProvider.EnsureValidAuth.Invoke()
+}
+
+function Get-AuthHeadersFromProvider {
+    <#
+    .SYNOPSIS
+    Retrieves headers from the active auth provider.
+    #>
+    Ensure-AuthProviderInitialized
+    return $Script:AuthProvider.GetAuthHeaders.Invoke()
+}
+
+function Try-RefreshAuthOnce {
+    <#
+    .SYNOPSIS
+    Attempts a single refresh via the provider (if supported).
+    #>
+    Ensure-AuthProviderInitialized
+    if ($Script:AuthProvider.PSObject.Methods.Match('TryRefreshOnce').Count -gt 0) {
+        return [bool]$Script:AuthProvider.TryRefreshOnce.Invoke()
+    }
+    return $false
+}
 
 function Get-AccessToken {
     <#
@@ -439,22 +677,44 @@ function Confirm-AuthenticatedIdentity {
 
     if (-not [string]::IsNullOrWhiteSpace($Script:AuthenticatedUsername)) { return }
 
-    # Ensure we have a token before calling /me
-    Confirm-AccessToken
-    if (-not $Script:TokenInfo -or [string]::IsNullOrWhiteSpace([string]$Script:TokenInfo.AccessToken)) {
-        throw 'Access token missing after Confirm-AccessToken.'
-    }
+    Ensure-AuthIsReady
+    $headers = Get-AuthHeadersFromProvider
+    $meUri = Build-RedditUri -Path '/api/v1/me'
 
-    # IMPORTANT: Call /api/v1/me without Invoke-RedditApi to avoid any future recursion footguns.
-    $headers = @{ 'Authorization' = "bearer $($Script:TokenInfo.AccessToken)"; 'User-Agent' = $UserAgent }
-    $resp = Invoke-WebRequest -Method Get -Uri 'https://oauth.reddit.com/api/v1/me' -Headers $headers -ErrorAction Stop
+    $refreshed = $false
+    try {
+        $resp = Invoke-WebRequest -Method Get -Uri $meUri -Headers $headers -ErrorAction Stop
+    }
+    catch {
+        $status = $null
+        try {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+        }
+        catch { $status = $null }
+
+        if (($status -eq 401 -or $status -eq 403) -and -not $refreshed) {
+            $refreshed = Try-RefreshAuthOnce
+            if ($refreshed) {
+                Ensure-AuthIsReady
+                $headers = Get-AuthHeadersFromProvider
+                $resp = Invoke-WebRequest -Method Get -Uri $meUri -Headers $headers -ErrorAction Stop
+            }
+            else {
+                throw "Authentication failed for /api/v1/me (status $status). Provider could not refresh; stop to avoid acting unauthenticated."
+            }
+        }
+        else {
+            throw
+        }
+    }
 
     $rawContent = $resp.Content
     if ([string]::IsNullOrWhiteSpace([string]$rawContent)) {
         throw 'Unable to verify authenticated user via /api/v1/me (empty response body).'
     }
-    $trimmed = ([string]$rawContent).Trim()
-    if ($trimmed -match '<!DOCTYPE html|<html') {
+    if (Test-IsHtmlContent -Content $rawContent) {
         throw 'Unexpected HTML response from Reddit /api/v1/me (possible auth/rate-limit/protection page).'
     }
 
@@ -585,10 +845,10 @@ function Get-OverwriteText {
     }
 }
 
-function Invoke-RedditApi {
+function Invoke-RedditRequest {
     <#
     .SYNOPSIS
-    Wrapper for Reddit API calls with automatic retry, rate-limit handling, and token refresh.
+    Wrapper for Reddit API calls with automatic retry, rate-limit handling, and provider-driven auth.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -603,14 +863,13 @@ function Invoke-RedditApi {
         [string]$Context
     )
 
-    # Ensure we have a valid access token before making API calls
-    Confirm-AccessToken
+    Ensure-AuthIsReady
 
     # Retry configuration for transient failures
     $maxAttempts = 5
     $attempt = 0
     $backoff = 2  # Initial backoff in seconds, doubles on each retry
-    $refreshedOn401 = $false
+    $refreshedOnAuthFailure = $false
 
     while ($attempt -lt $maxAttempts) {
         $attempt++
@@ -628,8 +887,8 @@ function Invoke-RedditApi {
             }
         }
 
-        # Build OAuth bearer token header (required for all authenticated Reddit API calls)
-        $headers = @{ 'Authorization' = "bearer $($Script:TokenInfo.AccessToken)"; 'User-Agent' = $UserAgent }
+        # Build provider-supplied auth headers
+        $headers = Get-AuthHeadersFromProvider
 
         # Prepare request parameters; ResponseHeadersVariable captures rate-limit headers
         $params = @{ Method = $Method; Uri = $Uri; Headers = $headers; ErrorAction = 'Stop'; ResponseHeadersVariable = 'respHeaders' }
@@ -667,7 +926,7 @@ function Invoke-RedditApi {
                 $trimmed = ([string]$rawContent).Trim()
 
                 # AllowNonJsonResponse is intended for endpoints that return empty/opaque bodies, not HTML defenses.
-                if ($trimmed -match '<!DOCTYPE html|<html') {
+                if (Test-IsHtmlContent -Content $trimmed) {
                     throw "Unexpected HTML response from Reddit (possible auth/rate-limit/protection page)."
                 }
 
@@ -828,13 +1087,18 @@ function Invoke-RedditApi {
                 }
             }
 
-            # 401: token can expire or be invalidated mid-run; refresh once and retry
-            if ($status -eq 401 -and -not $refreshedOn401 -and $attempt -lt $maxAttempts) {
+            # 401/403: allow one refresh attempt, then stop
+            if (($status -eq 401 -or $status -eq 403) -and -not $refreshedOnAuthFailure -and $attempt -lt $maxAttempts) {
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
-                Write-Warning "API call returned 401 Unauthorized$ctx; refreshing token and retrying once."
-                Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Username $Username -Password $Password -RefreshToken $RefreshToken -UserAgent $UserAgent
-                $refreshedOn401 = $true
-                continue
+                Write-Warning "API call returned $status$ctx; attempting a single auth refresh."
+                $refreshed = Try-RefreshAuthOnce
+                if ($refreshed) {
+                    $refreshedOnAuthFailure = $true
+                    Ensure-AuthIsReady
+                    continue
+                }
+
+                throw "Authentication failed with status $status$ctx and refresh is unsupported/failed. Stopping to avoid unauthenticated actions."
             }
 
             # Retry policy
@@ -898,8 +1162,8 @@ function Get-CommentsPage {
 
     $targetUser = $Script:AuthenticatedUsername
     if ([string]::IsNullOrWhiteSpace($targetUser)) { $targetUser = $Username }
-    $uri = "https://oauth.reddit.com/user/$targetUser/comments"
-    Invoke-RedditApi -Method Get -Uri $uri -Query $query
+    $uri = Build-RedditUri -Path "/user/$targetUser/comments"
+    Invoke-RedditRequest -Method Get -Uri $uri -Query $query
 }
 
 function Save-Checkpoint {
@@ -1107,6 +1371,9 @@ if ($TwoPassProbability -gt 0) {
 # Ensure CSV report exists with headers
 Initialize-Report
 
+# Initialize auth provider early to surface auth-mode issues before destructive actions
+Ensure-AuthProviderInitialized
+
 # Verify authenticated identity once and use it for listing/reporting
 Confirm-AuthenticatedIdentity
 Write-Host "Authenticated as /u/$($Script:AuthenticatedUsername)" -ForegroundColor Green
@@ -1211,7 +1478,7 @@ while ($true) {
                 try {
                     # Reddit's editusertext endpoint requires thing_id and new text
                     $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body -IsWrite -Context $fullname
+                    Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body -IsWrite -Context $fullname
                     $summary.edited++
                     $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                 }
@@ -1244,7 +1511,7 @@ while ($true) {
                 if (-not $DryRun) {
                     try {
                         $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
-                        Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/editusertext' -Body $body2 -IsWrite -Context $fullname
+                        Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body2 -IsWrite -Context $fullname
                         $summary.edited++
                         $editStatus = 'edited(2/2)'
                     }
@@ -1269,7 +1536,7 @@ while ($true) {
             try {
                 # Reddit's del endpoint requires the thing's full name
                 $body = @{ api_type = 'json'; id = $fullname }
-                Invoke-RedditApi -Method Post -Uri 'https://oauth.reddit.com/api/del' -Body $body -IsWrite -Context $fullname
+                Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/del') -Body $body -IsWrite -Context $fullname
                 $summary.deleted++
                 $deleteStatus = 'deleted'
             }

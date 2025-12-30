@@ -75,14 +75,17 @@ You will pass these to the script as:
 
 ## 3) Choose your authentication method (pick ONE)
 
-This script enforces that you supply **exactly one** of these:
+This script enforces that you pick exactly one auth mode:
 
-- `-Password` **OR**
-- `-RefreshToken`
+- `-AuthMode OAuth` (default)
+  - Supply **either** `-Password` **or** `-RefreshToken` (not both)
+- `-AuthMode SessionDerived` (advanced, single-user)
+  - Supply `-SessionAccessToken` (SecureString bearer-style token derived from your signed-in session)
+  - Optional: `-SessionApiBaseUri`, `-SessionAuthorizationScheme`, `-SessionSecretName`
 
-If you supply both (or neither), the script will stop with an error.
+If you supply conflicting parameters (both OAuth secrets and session token), the script will stop with an error.
 
-### Option A — Password authentication (quickest)
+### Option A — Password authentication (quickest, OAuth)
 
 You provide your Reddit password at runtime as a `SecureString`:
 
@@ -94,7 +97,7 @@ Notes:
 - The password is converted to plaintext **only** during the token request.
 - It is not written to disk by this script.
 
-### Option B — Refresh token authentication (best for repeat runs)
+### Option B — Refresh token authentication (best for repeat runs, OAuth)
 
 A refresh token is an OAuth credential you generate once and then store securely.
 It allows the script to obtain access tokens without your password.
@@ -202,6 +205,13 @@ In the output, look for:
 Store that refresh token somewhere safe (a password manager is ideal).
 
 When you run the cleanup script, you’ll paste that refresh token when prompted (as a SecureString).
+
+### Option C — Session-derived token (advanced, single-user)
+
+- Use `-AuthMode SessionDerived` and pass `-SessionAccessToken (Read-Host "Session token" -AsSecureString)`.
+- Optional: `-SessionApiBaseUri` and `-SessionAuthorizationScheme` if your token expects non-default values.
+- Treat the token as highly sensitive; do not log it. Prefer OS-protected secret storage if you cache it externally.
+- Session reuse may be against Reddit’s terms and can trigger account enforcement. Use interactively, at low volume, and stop if you see challenges/HTML defenses.
 
 ---
 
