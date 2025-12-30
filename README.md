@@ -7,7 +7,7 @@ It’s basically spring cleaning for your comment history, except the broom is a
 ## ✅ What this is
 
 - 🧩 A single-file PowerShell script: `Invoke-RedditCommentDeath.ps1`
-- 🔐 Uses Reddit OAuth (script app) to authenticate as you
+- 🔐 Auth: session-derived token reuse by default; OAuth (script app) still available
 - 🔎 Scans your user comment listing (newest → oldest)
 - ⏳ Processes comments older than `-DaysOld`
 - ✍️🧼 Optionally overwrites comment text (default) before deleting
@@ -25,9 +25,9 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 ## 🛡️ Features (aka “the safety rails”)
 
-- 🔑 **Two auth modes (exactly one):**
-  - OAuth: password grant (`-Password`) or refresh-token grant (`-RefreshToken`)
-  - Session-derived token reuse (`-AuthMode SessionDerived` + `-SessionAccessToken`), single-user only
+- 🔑 **Two auth modes (exactly one, default SessionDerived):**
+  - Session-derived token reuse (`-SessionAccessToken`, optional `-SessionApiBaseUri` / `-SessionAuthorizationScheme`), single-user only
+  - OAuth: password grant (`-Password`) or refresh-token grant (`-RefreshToken`) with `-AuthMode OAuth`
 - 🧑‍⚖️ **Identity verification:** confirms `/api/v1/me` matches `-Username` before doing anything destructive.
 - 🔁 **Resume support:** safe to stop/re-run; it won’t reprocess already handled comments.
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
@@ -35,28 +35,26 @@ It’s basically spring cleaning for your comment history, except the broom is a
 - 📊 **CSV report output:** so future-you can answer “what did I do?” without guessing.
 - 🚫 **Exclude subreddits:** optionally skip specific subreddits using `-ExcludedSubredditsFile` (one subreddit name per line).
 
-## 📦 Requirements
+## 🧾 Requirements
 
 - 🐉 **PowerShell 7+** (the script declares `#requires -Version 7.0`)
-- 🧾 A Reddit **script app** (client id + secret)
-- 🧭 Scopes appropriate to what you plan to do:
+- For the default session-derived mode: a session-derived access token from a logged-in Reddit session (passed securely via `-SessionAccessToken`); `-Username` is optional and will be adopted from `/api/v1/me` if omitted.
+- For OAuth mode (`-AuthMode OAuth`): a Reddit **script app** (client id + secret) and either `-Password` or `-RefreshToken` (not both). `-Username` is optional but recommended; it will be enforced against `/api/v1/me` if supplied.
+- 🧭 OAuth scopes if using OAuth mode:
   - listing: `identity,history,read`
   - overwriting: `edit`
   - deleting: handled by the authenticated API flow used by the script
 
-## 🚀 Quick start (the basics)
+## 🚀 Quick start (default: session-derived)
 
-1) Create a Reddit “script” app to get a **Client ID** and **Client Secret**:
-- https://www.reddit.com/prefs/apps
+1) Obtain a session-derived token from your logged-in Reddit session (treat as highly sensitive; do not log it).
 
 2) Run a dry run first (seriously):
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `
-  -Password (Read-Host "Password" -AsSecureString) `
+  -SessionAccessToken (Read-Host "Session token" -AsSecureString) `
   -DaysOld 90 `
   -DryRun
 ```
@@ -65,10 +63,8 @@ It’s basically spring cleaning for your comment history, except the broom is a
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
-  -ClientId "YOUR_ID" `
-  -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `
-  -Password (Read-Host "Password" -AsSecureString) `
+  -SessionAccessToken (Read-Host "Session token" -AsSecureString) `
   -DaysOld 90
 ```
 
@@ -95,10 +91,41 @@ Then run:
   -ExcludedSubredditsFile "./excluded-subreddits.txt"
 ```
 
+### OAuth quick start (alternate)
+
+1) Create a Reddit “script” app to get a **Client ID** and **Client Secret**:
+- https://www.reddit.com/prefs/apps
+
+2) Dry run with password grant:
+
+```powershell
+./Invoke-RedditCommentDeath.ps1 `
+  -AuthMode OAuth `
+  -ClientId "YOUR_ID" `
+  -ClientSecret "YOUR_SECRET" `
+  -Username "YOUR_USERNAME" `
+  -Password (Read-Host "Password" -AsSecureString) `
+  -DaysOld 90 `
+  -DryRun
+```
+
+3) Real run (password grant):
+
+```powershell
+./Invoke-RedditCommentDeath.ps1 `
+  -AuthMode OAuth `
+  -ClientId "YOUR_ID" `
+  -ClientSecret "YOUR_SECRET" `
+  -Username "YOUR_USERNAME" `
+  -Password (Read-Host "Password" -AsSecureString) `
+  -DaysOld 90
+```
+
 4) Prefer a refresh token for repeat runs:
 
 ```powershell
 ./Invoke-RedditCommentDeath.ps1 `
+  -AuthMode OAuth `
   -ClientId "YOUR_ID" `
   -ClientSecret "YOUR_SECRET" `
   -Username "YOUR_USERNAME" `

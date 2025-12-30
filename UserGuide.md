@@ -36,9 +36,9 @@ In examples below, the script is named:
 
 ---
 
-## 2) Create a Reddit API “script” app (Client ID + Secret)
+## 2) (OAuth mode only) Create a Reddit API “script” app (Client ID + Secret)
 
-Reddit API access starts by registering an application under your Reddit account.
+You only need this if you choose `-AuthMode OAuth`. The default session-derived mode does **not** require a client id/secret.
 
 ### Step-by-step
 
@@ -75,17 +75,27 @@ You will pass these to the script as:
 
 ## 3) Choose your authentication method (pick ONE)
 
-This script enforces that you pick exactly one auth mode:
+This script enforces that you pick exactly one auth mode (default is SessionDerived). Provide only what the chosen mode needs:
 
-- `-AuthMode OAuth` (default)
-  - Supply **either** `-Password` **or** `-RefreshToken` (not both)
-- `-AuthMode SessionDerived` (advanced, single-user)
+- `-AuthMode SessionDerived` (default; single-user)
   - Supply `-SessionAccessToken` (SecureString bearer-style token derived from your signed-in session)
   - Optional: `-SessionApiBaseUri`, `-SessionAuthorizationScheme`, `-SessionSecretName`
+  - `-Username` is optional; if omitted, the script adopts the authenticated username returned by `/api/v1/me`.
+- `-AuthMode OAuth`
+  - Supply **either** `-Password` **or** `-RefreshToken` (not both) plus `-ClientId` and `-ClientSecret`
+  - `-Username` is optional but recommended; if omitted, the script adopts the authenticated username after verifying `/api/v1/me`.
 
 If you supply conflicting parameters (both OAuth secrets and session token), the script will stop with an error.
 
-### Option A — Password authentication (quickest, OAuth)
+### Option A — Session-derived token (default, single-user)
+
+- Use `-AuthMode SessionDerived` (default).
+- Provide your session-derived access token securely: `-SessionAccessToken (Read-Host "Session token" -AsSecureString)`.
+- Optional: set `-SessionApiBaseUri` and `-SessionAuthorizationScheme` if your token expects non-default values.
+- Treat the token as highly sensitive; do not log it. Prefer OS-protected secret storage if you cache it externally.
+- Session reuse may be against Reddit’s terms and can trigger account enforcement. Use interactively, at low volume, and stop if you see challenges/HTML defenses.
+
+### Option B — Password authentication (OAuth)
 
 You provide your Reddit password at runtime as a `SecureString`:
 
@@ -97,7 +107,7 @@ Notes:
 - The password is converted to plaintext **only** during the token request.
 - It is not written to disk by this script.
 
-### Option B — Refresh token authentication (best for repeat runs, OAuth)
+### Option C — Refresh token authentication (best for repeat runs, OAuth)
 
 A refresh token is an OAuth credential you generate once and then store securely.
 It allows the script to obtain access tokens without your password.
@@ -205,13 +215,6 @@ In the output, look for:
 Store that refresh token somewhere safe (a password manager is ideal).
 
 When you run the cleanup script, you’ll paste that refresh token when prompted (as a SecureString).
-
-### Option C — Session-derived token (advanced, single-user)
-
-- Use `-AuthMode SessionDerived` and pass `-SessionAccessToken (Read-Host "Session token" -AsSecureString)`.
-- Optional: `-SessionApiBaseUri` and `-SessionAuthorizationScheme` if your token expects non-default values.
-- Treat the token as highly sensitive; do not log it. Prefer OS-protected secret storage if you cache it externally.
-- Session reuse may be against Reddit’s terms and can trigger account enforcement. Use interactively, at low volume, and stop if you see challenges/HTML defenses.
 
 ---
 

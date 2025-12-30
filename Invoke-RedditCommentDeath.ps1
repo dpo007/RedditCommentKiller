@@ -111,37 +111,60 @@ Emit extra diagnostic output.
 
 #requires -Version 7.0
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'SessionDerived')]
 param(
-    [Parameter()]
-    [string]$ClientId,
-
-    [Parameter()]
-    [string]$ClientSecret,
-
-    [Parameter(Mandatory = $true)]
+    # Common
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [Parameter(ParameterSetName = 'OAuthPassword')]
+    [Parameter(ParameterSetName = 'OAuthRefresh')]
     [string]$Username,
 
-    [ValidateSet('OAuth', 'SessionDerived')]
-    [string]$AuthMode = 'OAuth',
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [Parameter(ParameterSetName = 'OAuthPassword')]
+    [Parameter(ParameterSetName = 'OAuthRefresh')]
+    [ValidateSet('SessionDerived', 'OAuth')]
+    [string]$AuthMode,
 
-    [SecureString]$Password,
-
-    [SecureString]$RefreshToken,
-
-    [SecureString]$SessionAccessToken,
-
-    [string]$SessionApiBaseUri = 'https://oauth.reddit.com',
-
-    [string]$SessionAuthorizationScheme = 'bearer',
-
-    [string]$SessionSecretName,
-
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [Parameter(ParameterSetName = 'OAuthPassword')]
+    [Parameter(ParameterSetName = 'OAuthRefresh')]
     [string]$UserAgent,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'SessionDerived')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
     [ValidateRange(1, 5000)]
     [int]$DaysOld,
+
+    # Session-derived mode
+    [Parameter(Mandatory = $true, ParameterSetName = 'SessionDerived')]
+    [SecureString]$SessionAccessToken,
+
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [string]$SessionApiBaseUri = 'https://oauth.reddit.com',
+
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [string]$SessionAuthorizationScheme = 'bearer',
+
+    [Parameter(ParameterSetName = 'SessionDerived')]
+    [string]$SessionSecretName,
+
+    # OAuth shared
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
+    [string]$ClientId,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
+    [string]$ClientSecret,
+
+    # OAuth: password grant
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthPassword')]
+    [SecureString]$Password,
+
+    # OAuth: refresh-token grant
+    [Parameter(Mandatory = $true, ParameterSetName = 'OAuthRefresh')]
+    [SecureString]$RefreshToken,
 
     [ValidateRange(0, 720)]
     [int]$SafetyHours = 0,
@@ -201,45 +224,50 @@ param(
     [switch]$VerboseLogging
 )
 
+# Normalize AuthMode based on selected parameter set and enforce consistency
+switch ($PSCmdlet.ParameterSetName) {
+    'SessionDerived' {
+        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'SessionDerived' }
+        if (-not [string]::Equals($AuthMode, 'SessionDerived', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "AuthMode '$AuthMode' is not allowed in the SessionDerived parameter set."
+        }
+    }
+    'OAuthPassword' {
+        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'OAuth' }
+        if (-not [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "AuthMode '$AuthMode' is not allowed in the OAuthPassword parameter set."
+        }
+    }
+    'OAuthRefresh' {
+        if ([string]::IsNullOrWhiteSpace($AuthMode)) { $AuthMode = 'OAuth' }
+        if (-not [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "AuthMode '$AuthMode' is not allowed in the OAuthRefresh parameter set."
+        }
+    }
+    default {
+        throw "Unknown parameter set '$($PSCmdlet.ParameterSetName)'."
+    }
+}
+
 $usingOAuth = [string]::Equals($AuthMode, 'OAuth', [System.StringComparison]::OrdinalIgnoreCase)
-$usingSessionDerived = [string]::Equals($AuthMode, 'SessionDerived', [System.StringComparison]::OrdinalIgnoreCase)
+$usingSessionDerived = -not $usingOAuth
 
 $hasPassword = $PSBoundParameters.ContainsKey('Password') -and $null -ne $Password
 $hasRefreshToken = $PSBoundParameters.ContainsKey('RefreshToken') -and $null -ne $RefreshToken
 $hasSessionToken = $PSBoundParameters.ContainsKey('SessionAccessToken') -and $null -ne $SessionAccessToken
 
-if (-not ($usingOAuth -xor $usingSessionDerived)) {
-    throw "AuthMode must be either 'OAuth' or 'SessionDerived'."
-}
-
-if ($usingOAuth) {
-    if ([string]::IsNullOrWhiteSpace($ClientId)) { throw "-ClientId is required when -AuthMode OAuth." }
-    if ([string]::IsNullOrWhiteSpace($ClientSecret)) { throw "-ClientSecret is required when -AuthMode OAuth." }
-
-    if ($hasPassword -and $hasRefreshToken) {
-        throw "Specify either -Password or -RefreshToken, not both, when -AuthMode OAuth."
-    }
-
-    if (-not $hasPassword -and -not $hasRefreshToken) {
-        throw "Specify one authentication method (-Password or -RefreshToken) when -AuthMode OAuth."
+# Extra guardrails for parameter misuse across sets (PowerShell already enforces most conflicts)
+if ($usingSessionDerived) {
+    if (-not $hasSessionToken) { throw "SessionDerived mode requires -SessionAccessToken (SecureString)." }
+    if ([string]::IsNullOrWhiteSpace($SessionApiBaseUri)) { throw "-SessionApiBaseUri cannot be empty when -AuthMode SessionDerived." }
+    if ([string]::IsNullOrWhiteSpace($SessionAuthorizationScheme)) { throw "-SessionAuthorizationScheme cannot be empty when -AuthMode SessionDerived." }
+    if ($hasPassword -or $hasRefreshToken -or $PSBoundParameters.ContainsKey('ClientId') -or $PSBoundParameters.ContainsKey('ClientSecret')) {
+        throw "OAuth credentials/secrets are not used with -AuthMode SessionDerived; omit them to avoid accidental mixing of auth modes."
     }
 }
 else {
-    if (-not $hasSessionToken) {
-        throw "SessionDerived mode requires -SessionAccessToken (SecureString)."
-    }
-
-    if ($hasPassword -or $hasRefreshToken) {
-        throw "-Password and -RefreshToken are not used with -AuthMode SessionDerived; omit them to avoid accidental mixing of auth modes."
-    }
-
-    if ([string]::IsNullOrWhiteSpace($SessionApiBaseUri)) {
-        throw "-SessionApiBaseUri cannot be empty when -AuthMode SessionDerived."
-    }
-
-    if ([string]::IsNullOrWhiteSpace($SessionAuthorizationScheme)) {
-        throw "-SessionAuthorizationScheme cannot be empty when -AuthMode SessionDerived."
-    }
+    if ($hasPassword -and $hasRefreshToken) { throw 'Specify either -Password or -RefreshToken, not both, when using OAuth.' }
+    if (-not $hasPassword -and -not $hasRefreshToken) { throw 'Specify one authentication method (-Password or -RefreshToken) when using OAuth.' }
 }
 
 # Validate delay range parameters to ensure min <= max
@@ -274,7 +302,8 @@ if ([string]::IsNullOrWhiteSpace($TwoPassSaltPath)) {
 # Auto-generate UserAgent if not provided (Reddit API requirement)
 if ([string]::IsNullOrWhiteSpace($UserAgent)) {
     $platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } elseif ($IsLinux) { 'linux' } else { 'unknown' }
-    $UserAgent = "${platform}:RedditCommentKiller:v1.0 (by /u/$Username)"
+    $uaUser = [string]::IsNullOrWhiteSpace($Username) ? 'anonymous' : $Username
+    $UserAgent = "${platform}:RedditCommentKiller:v1.0 (by /u/$uaUser)"
     if ($VerboseLogging) { Write-Verbose "Generated UserAgent: $UserAgent" }
 }
 
@@ -742,9 +771,14 @@ function Confirm-AuthenticatedIdentity {
     $Script:AuthenticatedUsername = $name
     if ($VerboseLogging) { Write-Verbose "Authenticated as /u/$($Script:AuthenticatedUsername) (verified via /api/v1/me)" }
 
-    # Guard against silent no-ops/misconfig: ensure -Username matches the authenticated identity.
-    if (-not [string]::Equals($Script:AuthenticatedUsername, $Username, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Authenticated as /u/$($Script:AuthenticatedUsername), but -Username was '$Username'. Refusing to continue to avoid targeting the wrong account or doing a silent no-op."
+    # If a username was provided, enforce it matches; otherwise adopt the authenticated username for targeting/reporting.
+    if (-not [string]::IsNullOrWhiteSpace($Username)) {
+        if (-not [string]::Equals($Script:AuthenticatedUsername, $Username, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Authenticated as /u/$($Script:AuthenticatedUsername), but -Username was '$Username'. Refusing to continue to avoid targeting the wrong account or doing a silent no-op."
+        }
+    }
+    else {
+        $script:Username = $Script:AuthenticatedUsername
     }
 }
 
