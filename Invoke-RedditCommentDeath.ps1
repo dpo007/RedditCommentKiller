@@ -51,10 +51,13 @@ Minimum seconds to wait between operations across comments.
 Maximum seconds to wait between operations across comments.
 
 .PARAMETER BatchSize
-Number of comments to process before pausing for BatchCooldownSeconds.
+Number of comments to process before pausing for BatchCooldownMinutesMin..BatchCooldownMinutesMax.
 
-.PARAMETER BatchCooldownSeconds
-Seconds to pause after each batch to stay under rate limits.
+.PARAMETER BatchCooldownMinutesMin
+Minimum minutes to pause after each batch to stay under rate limits.
+
+.PARAMETER BatchCooldownMinutesMax
+Maximum minutes to pause after each batch to stay under rate limits.
 
 .PARAMETER ResumePath
 Path to checkpoint JSON for resuming.
@@ -153,8 +156,11 @@ param(
     [ValidateRange(1, 1000)]
     [int]$BatchSize = 100,
 
-    [ValidateRange(1, 86400)]
-    [int]$BatchCooldownSeconds = 600,
+    [ValidateRange(1, 1440)]
+    [int]$BatchCooldownMinutesMin = 5,
+
+    [ValidateRange(1, 1440)]
+    [int]$BatchCooldownMinutesMax = 10,
 
     # Checkpoint state file (cursor) so runs can resume.
     [string]$ResumePath = './reddit_cleanup_state.json',
@@ -192,6 +198,10 @@ if ($EditDelaySecondsMax -lt $EditDelaySecondsMin) {
 
 if ($BetweenItemsDelayMax -lt $BetweenItemsDelayMin) {
     throw "BetweenItemsDelayMax must be >= BetweenItemsDelayMin"
+}
+
+if ($BatchCooldownMinutesMax -lt $BatchCooldownMinutesMin) {
+    throw "BatchCooldownMinutesMax must be >= BatchCooldownMinutesMin"
 }
 
 # Derive processed log path from ResumePath unless explicitly provided.
@@ -1664,8 +1674,10 @@ while ($true) {
 
         # Batch cooldown: pause after processing BatchSize items to stay well under rate limits
         if ($batchCount -ge $BatchSize) {
-            Write-Host "Batch of $batchCount completed; cooling down for $BatchCooldownSeconds seconds" -ForegroundColor Yellow
-            Wait-WithProgress -Seconds $BatchCooldownSeconds -Activity 'Batch cooldown' -Status "Pausing after $batchCount items" -NoProgress:$NoProgress
+            $batchCooldownSeconds = Get-RandomDelay -MinSeconds ($BatchCooldownMinutesMin * 60) -MaxSeconds ($BatchCooldownMinutesMax * 60)
+            $batchCooldownMinutes = [Math]::Round($batchCooldownSeconds / 60.0, 2)
+            Write-Host ("Batch of {0} completed; cooling down for {1} seconds (~{2} minutes)" -f $batchCount, $batchCooldownSeconds, $batchCooldownMinutes) -ForegroundColor Yellow
+            Wait-WithProgress -Seconds $batchCooldownSeconds -Activity 'Batch cooldown' -Status ("Pausing after {0} items" -f $batchCount) -NoProgress:$NoProgress
             $batchCount = 0
         }
 
