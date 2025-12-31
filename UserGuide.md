@@ -5,6 +5,8 @@ This guide walks you through setting up and safely running the Reddit comment cl
 **Auth note (important):**
 Authentication is **session-derived token reuse only** (single-user). Why not OAuth? Reddit is axing OAuth API access for regular users, so this script sticks to the session tokens you already have.
 
+This script does not implement an app-based OAuth client flow; it reuses the Bearer token your browser session is already using.
+
 > **What this script does**
 >
 > - Lists **your own Reddit comments** (newest → oldest)
@@ -79,7 +81,7 @@ These steps use **Microsoft Edge**, but the process is similar in other Chromium
      ```
    - Look for a request similar to:
      ```
-     https://www.reddit.com/api/v1/me
+     https://oauth.reddit.com/api/v1/me
      ```
 
 5. **Inspect the request**
@@ -181,13 +183,22 @@ Overwrite modes:
 - `reddit_cleanup_state.processed_ids.log` — processed IDs
 - `reddit_cleanup_report.csv` — report
 
+If you enable two-pass overwrites (set `-TwoPassProbability` > 0), it will also create:
+
+- `reddit_cleanup_state.two_pass_salt.txt` — stable salt used to keep two-pass selection consistent across runs
+
 ---
 
 ## 9) Resume behavior
 
 Re-run the same command to continue safely.
 
-Delete state files to start fresh.
+To start fresh, delete both of these (they work together):
+
+- `reddit_cleanup_state.json`
+- `reddit_cleanup_state.processed_ids.log`
+
+(Optionally delete the CSV report too if you want a clean report file.)
 
 ---
 

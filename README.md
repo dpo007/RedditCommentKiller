@@ -98,6 +98,10 @@ By default the script creates these files alongside where you run it:
 - `./reddit_cleanup_state.processed_ids.log` (append-only processed fullnames)
 - `./reddit_cleanup_report.csv` (what happened)
 
+If you enable two-pass overwrites (set `-TwoPassProbability` > 0), it will also create a stable salt file:
+
+- `./reddit_cleanup_state.two_pass_salt.txt` (used to keep two-pass selection consistent across runs)
+
 Paths can be overridden via parameters.
 
 ### 🧭 Listing window caveat
