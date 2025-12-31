@@ -30,6 +30,7 @@ It’s basically spring cleaning for your comment history. It runs using a sessi
 - 🔑 **Auth:** session-derived token reuse (`-SessionAccessToken`), single-user only
 - 🧑‍⚖️ **Identity verification:** verifies `/api/v1/me` before doing anything destructive.
 - 🔁 **Resume support:** safe to stop/re-run; it won’t reprocess already handled comments.
+- 🔄 **Multi-pass until exhausted:** reruns passes from newest → oldest until a pass finds no eligible comments (works around Reddit’s ~1k comment listing window); adjustable via `-MaxPasses`.
 - 🐢 **Rate-limit aware:** randomized delays + batching cooldowns + defensive retry logic.
 - 🧪 **Dry runs:** see what would happen without changing anything.
 - 📊 **CSV report output:** so future-you can answer “what did I do?” without guessing.
@@ -98,6 +99,11 @@ By default the script creates these files alongside where you run it:
 - `./reddit_cleanup_report.csv` (what happened)
 
 Paths can be overridden via parameters.
+
+### 🧭 Listing window caveat
+
+- Reddit’s `/user/{name}/comments` listing exposes roughly the newest 1,000 comments. Multi-pass mode shrinks that window over time and stops when a pass finds zero eligible items (older-than-cutoff, not excluded, not already processed). Excluded or newer comments remain and can still occupy that window.
+- Optional `-RetryFailures` keeps failed deletes off the processed list so they’re retried on later passes (default behavior marks failures processed).
 
 ## ⚠️ A small, friendly warning
 

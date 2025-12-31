@@ -115,6 +115,10 @@ param(
     [ValidateRange(0, 720)]
     [int]$SafetyHours = 0,
 
+    # Maximum number of full passes to run (outer loop safeguard)
+    [ValidateRange(1, 100)]
+    [int]$MaxPasses = 10,
+
     [switch]$SkipOverwrite,
 
     # Optional stop optimization: end pagination once pages beyond cutoff are mostly already processed.
@@ -161,6 +165,9 @@ param(
 
     [ValidateRange(1, 1440)]
     [int]$BatchCooldownMinutesMax = 10,
+
+    # Retry items that fail (edit/delete) instead of marking them processed (opt-in)
+    [switch]$RetryFailures,
 
     # Checkpoint state file (cursor) so runs can resume.
     [string]$ResumePath = './reddit_cleanup_state.json',
@@ -1207,12 +1214,15 @@ function Import-Checkpoint {
             $loaded = Get-Content -Path $ResumePath -Raw | ConvertFrom-Json -ErrorAction Stop
 
             # Backward-compat: older checkpoints stored a large `processed` array.
-            # Newer checkpoints only store `after`.
+            # Newer checkpoints only store `after` and `pass`.
             if ($null -eq $loaded.processed) {
                 $loaded | Add-Member -NotePropertyName processed -NotePropertyValue @() -Force
             }
             if ($null -eq $loaded.after) {
                 $loaded | Add-Member -NotePropertyName after -NotePropertyValue $null -Force
+            }
+            if ($null -eq $loaded.pass -or $loaded.pass -lt 1) {
+                $loaded | Add-Member -NotePropertyName pass -NotePropertyValue 1 -Force
             }
             return $loaded
         }
@@ -1230,7 +1240,7 @@ function Import-Checkpoint {
         }
     }
     # Return empty state (no pagination token, no processed items)
-    return [PSCustomObject]@{ after = $null; processed = @() }
+    return [PSCustomObject]@{ after = $null; processed = @(); pass = 1 }
 }
 
 function Initialize-Report {
@@ -1426,17 +1436,18 @@ Initialize-AuthProvider
 Confirm-AuthenticatedIdentity
 Write-Host "Authenticated as /u/$($Script:AuthenticatedUsername)" -ForegroundColor Green
 
-# Track processing statistics for final summary
-$summary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
-$batchCount = 0
-$consecutiveMostlyProcessedPages = 0
+# Track processing statistics across all passes (aggregated)
+$overallSummary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
 
-# Resume from saved pagination token if available
-$after = $state.after
+# Determine starting pass (allows resume mid-pass)
+$startPass = 1
+if ($state.pass -and $state.pass -gt 0) { $startPass = [int]$state.pass }
+if ($startPass -gt $MaxPasses) {
+    Write-Warning "Checkpoint requested pass $startPass but MaxPasses is $MaxPasses; resuming at MaxPasses instead."
+    $startPass = $MaxPasses
+}
 
-# Once we encounter the first comment older than cutoff, we're in the “cutoff zone” and can
-# start applying stop-optimizations based on how many older items are already processed.
-$pastCutoffZone = $false
+Write-Host "Starting multi-pass scan (up to $MaxPasses passes). Resuming at pass $startPass." -ForegroundColor Cyan
 
 if ($SafetyHours -gt 0) {
     Write-Host "Scanning comments older than $DaysOld days with safety margin $SafetyHours h (effective cutoff UTC $($effectiveCutoffUtc.ToString('u')); raw cutoff $($cutoffUtc.ToString('u')))" -ForegroundColor Cyan
@@ -1445,262 +1456,289 @@ else {
     Write-Host "Scanning comments older than $DaysOld days (cutoff UTC $($effectiveCutoffUtc.ToString('u')))" -ForegroundColor Cyan
 }
 
-# Main pagination loop: iterate through all comment pages
-while ($true) {
-    # Fetch next page of comments using pagination token
-    $page = Get-CommentsPage -AfterToken $after
-    $data = $page.Data
+# Outer pass loop: restart from newest until a pass finds zero matches or MaxPasses reached
+for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
+    if ($pass -gt $startPass) {
+        # Reload state/log between passes to honor newly reachable comments
+        $state = Import-Checkpoint
+        $processedSet = Import-ProcessedLog
+        if ($null -eq $processedSet) { $processedSet = [System.Collections.Generic.HashSet[string]]::new() }
+        $processedCount = $processedSet.Count
+    }
 
-    # Stop if no more data returned
-    if (-not $data || -not $data.data.children) { break }
+    $summary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
+    $batchCount = 0
+    $consecutiveMostlyProcessedPages = 0
+    $pastCutoffZone = $false
 
-    $children = $data.data.children
-    if (-not $children) { break }
+    # Resume mid-pass if checkpoint has a cursor for this pass; otherwise restart from newest.
+    $after = if ($pass -eq $startPass) { $state.after } else { $null }
 
-    $pageOlderTotal = 0
-    $pageOlderUnprocessed = 0
+    Write-Host "-- Pass $pass / $MaxPasses --" -ForegroundColor Cyan
 
-    # Per-page stats are only counted for items older than the cutoff (after $pastCutoffZone becomes true).
-    # They are used to stop early when the remaining older items are already processed.
+    # Main pagination loop: iterate through all comment pages for this pass
+    while ($true) {
+        # Fetch next page of comments using pagination token
+        $page = Get-CommentsPage -AfterToken $after
+        $data = $page.Data
 
-    # Process each comment in the current page
-    foreach ($child in $children) {
-        $comment = $child.data
-        $summary.scanned++
+        # Stop if no more data returned
+        if (-not $data || -not $data.data.children) { break }
 
-        # Convert Unix timestamp to UTC DateTime for age comparison (Reddit timestamps are UTC)
-        # Guard against malformed/empty created_utc values (can otherwise flip $pastCutoffZone too early).
-        $createdUtcSeconds = 0L
-        $createdUtc = $null
-        try {
-            $rawCreated = $comment.created_utc
-            if ($null -ne $rawCreated) {
-                if ($rawCreated -is [double] -or $rawCreated -is [float] -or $rawCreated -is [decimal]) {
-                    $createdUtcSeconds = [int64][math]::Floor([double]$rawCreated)
-                }
-                else {
-                    $createdUtcSeconds = [int64]$rawCreated
+        $children = $data.data.children
+        if (-not $children) { break }
+
+        $pageOlderTotal = 0
+        $pageOlderUnprocessed = 0
+
+        # Process each comment in the current page
+        foreach ($child in $children) {
+            $comment = $child.data
+            $summary.scanned++
+
+            # Convert Unix timestamp to UTC DateTime for age comparison (Reddit timestamps are UTC)
+            # Guard against malformed/empty created_utc values (can otherwise flip $pastCutoffZone too early).
+            $createdUtcSeconds = 0L
+            $createdUtc = $null
+            try {
+                $rawCreated = $comment.created_utc
+                if ($null -ne $rawCreated) {
+                    if ($rawCreated -is [double] -or $rawCreated -is [float] -or $rawCreated -is [decimal]) {
+                        $createdUtcSeconds = [int64][math]::Floor([double]$rawCreated)
+                    }
+                    else {
+                        $createdUtcSeconds = [int64]$rawCreated
+                    }
                 }
             }
-        }
-        catch {
-            $createdUtcSeconds = 0L
-        }
-        if ($createdUtcSeconds -gt 0) {
-            $createdUtc = [DateTimeOffset]::FromUnixTimeSeconds($createdUtcSeconds).UtcDateTime
-        }
-        else {
-            if ($VerboseLogging) { Write-Verbose "Skipping item with missing/invalid created_utc (fullname=$($comment.name))" }
-            continue
-        }
+            catch {
+                $createdUtcSeconds = 0L
+            }
+            if ($createdUtcSeconds -gt 0) {
+                $createdUtc = [DateTimeOffset]::FromUnixTimeSeconds($createdUtcSeconds).UtcDateTime
+            }
+            else {
+                if ($VerboseLogging) { Write-Verbose "Skipping item with missing/invalid created_utc (fullname=$($comment.name))" }
+                continue
+            }
 
-        # Extract comment identifiers and metadata
-        $fullname = $comment.name  # Reddit's full thing ID (e.g., "t1_abc123")
-        if ([string]::IsNullOrWhiteSpace($fullname)) { continue }
+            # Extract comment identifiers and metadata
+            $fullname = $comment.name  # Reddit's full thing ID (e.g., "t1_abc123")
+            if ([string]::IsNullOrWhiteSpace($fullname)) { continue }
 
-        $permalink = "https://www.reddit.com$($comment.permalink)"
-        $subreddit = $comment.subreddit
-        if ([string]::IsNullOrWhiteSpace([string]$subreddit) -and $comment.PSObject.Properties.Match('subreddit_name_prefixed').Count -gt 0) {
-            $subreddit = $comment.subreddit_name_prefixed
-        }
-        $subredditNormalized = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
+            $permalink = "https://www.reddit.com$($comment.permalink)"
+            $subreddit = $comment.subreddit
+            if ([string]::IsNullOrWhiteSpace([string]$subreddit) -and $comment.PSObject.Properties.Match('subreddit_name_prefixed').Count -gt 0) {
+                $subreddit = $comment.subreddit_name_prefixed
+            }
+            $subredditNormalized = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
 
-        $threadTitle = ''
-        if ($comment.PSObject.Properties.Match('link_title').Count -gt 0) {
-            $threadTitle = ConvertTo-SingleLineText -Text ([string]$comment.link_title) -MaxLength 120
-        }
-        if ([string]::IsNullOrWhiteSpace($threadTitle)) {
-            $threadTitle = Get-ThreadTitleFromPermalink -Permalink $permalink
-        }
-        if ([string]::IsNullOrWhiteSpace($threadTitle)) {
-            $threadTitle = '(unknown thread)'
-        }
+            $threadTitle = ''
+            if ($comment.PSObject.Properties.Match('link_title').Count -gt 0) {
+                $threadTitle = ConvertTo-SingleLineText -Text ([string]$comment.link_title) -MaxLength 120
+            }
+            if ([string]::IsNullOrWhiteSpace($threadTitle)) {
+                $threadTitle = Get-ThreadTitleFromPermalink -Permalink $permalink
+            }
+            if ([string]::IsNullOrWhiteSpace($threadTitle)) {
+                $threadTitle = '(unknown thread)'
+            }
 
-        # Safety rule: never process anything newer than the cutoff, even if Reddit returns out-of-order items.
-        if ($createdUtc -gt $effectiveCutoffUtc) { continue }
+            # Safety rule: never process anything newer than the cutoff, even if Reddit returns out-of-order items.
+            if ($createdUtc -gt $effectiveCutoffUtc) { continue }
 
-        # Listing is typically newest -> oldest. Once we see the first older-than-cutoff item, we are in the cutoff zone.
-        if (-not $pastCutoffZone) { $pastCutoffZone = $true }
+            # Listing is typically newest -> oldest. Once we see the first older-than-cutoff item, we are in the cutoff zone.
+            if (-not $pastCutoffZone) { $pastCutoffZone = $true }
 
-        # Optional exclusion: skip comments in excluded subreddits before accounting for paging stop logic.
-        if ($excludedSubredditsSet.Count -gt 0 -and $subredditNormalized -and $excludedSubredditsSet.Contains($subredditNormalized)) {
-            if ($VerboseLogging) { Write-Verbose "Skipping $fullname in excluded subreddit r/$subredditNormalized" }
-            continue
-        }
+            # Optional exclusion: skip comments in excluded subreddits before accounting for paging stop logic.
+            if ($excludedSubredditsSet.Count -gt 0 -and $subredditNormalized -and $excludedSubredditsSet.Contains($subredditNormalized)) {
+                if ($VerboseLogging) { Write-Verbose "Skipping $fullname in excluded subreddit r/$subredditNormalized" }
+                continue
+            }
 
-        # Once past the cutoff, track per-page older-item stats for stop-optimizations
-        if ($pastCutoffZone) { $pageOlderTotal++ }
+            # Once past the cutoff, track per-page older-item stats for stop-optimizations
+            if ($pastCutoffZone) { $pageOlderTotal++ }
 
-        # Skip if already processed in previous run (resume functionality)
-        if ($processedSet.Contains($fullname)) { continue }
+            # Skip if already processed in previous run (resume functionality)
+            if ($processedSet.Contains($fullname)) { continue }
 
-        if ($pastCutoffZone) { $pageOlderUnprocessed++ }
+            if ($pastCutoffZone) { $pageOlderUnprocessed++ }
 
-        $summary.matched++
-        $actionDesc = "comment $fullname"
+            $summary.matched++
+            $actionDesc = "comment $fullname"
 
-        # Honor -WhatIf parameter (CmdletBinding SupportsShouldProcess)
-        if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) { continue }
+            # Honor -WhatIf parameter (CmdletBinding SupportsShouldProcess)
+            if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) { continue }
 
-        # Initialize tracking variables for this comment's processing
-        $overwriteText = $null
-        $editStatus = 'skipped'
-        $deleteStatus = 'skipped'
-        $errorMessage = ''
-        $didWrite = $false  # Track if we performed a write operation
+            # Initialize tracking variables for this comment's processing
+            $overwriteText = $null
+            $editStatus = 'skipped'
+            $deleteStatus = 'skipped'
+            $errorMessage = ''
+            $didWrite = $false  # Track if we performed a write operation
 
-        # Stable-random selection for two-pass overwrite (deterministic across re-runs for you; unpredictable to outsiders)
-        $doTwoPass = $false
-        if ($OverwriteEnabled -and $TwoPassProbability -gt 0 -and $twoPassSalt) {
-            $p = Get-StableProbability -Id $fullname -Salt $twoPassSalt
-            if ($p -lt $TwoPassProbability) { $doTwoPass = $true }
-        }
+            # Stable-random selection for two-pass overwrite (deterministic across re-runs for you; unpredictable to outsiders)
+            $doTwoPass = $false
+            if ($OverwriteEnabled -and $TwoPassProbability -gt 0 -and $twoPassSalt) {
+                $p = Get-StableProbability -Id $fullname -Salt $twoPassSalt
+                if ($p -lt $TwoPassProbability) { $doTwoPass = $true }
+            }
 
-        # Overwrite phase: replace comment content for privacy before deletion (unless -SkipOverwrite)
-        if ($OverwriteEnabled) {
-            $overwriteText = Get-OverwriteText -Mode $OverwriteMode
-            $didWrite = -not $DryRun
+            # Overwrite phase: replace comment content for privacy before deletion (unless -SkipOverwrite)
+            if ($OverwriteEnabled) {
+                $overwriteText = Get-OverwriteText -Mode $OverwriteMode
+                $didWrite = -not $DryRun
 
+                if (-not $DryRun) {
+                    try {
+                        # Reddit's editusertext endpoint requires thing_id and new text
+                        $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
+                        $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body -IsWrite -Context $fullname
+                        $summary.edited++
+                        $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
+                    }
+                    catch {
+                        # Continue to delete even if edit fails (e.g., archived/locked comments)
+                        $errorMessage = "Edit failed: $($_.Exception.Message)"
+                        Write-Warning "$fullname edit failed: $errorMessage"
+                        $summary.failures++
+                    }
+                }
+                else {
+                    # Dry-run mode: simulate without actual API calls
+                    $editStatus = $doTwoPass ? 'dry-run(1/2)' : 'dry-run'
+                }
+
+                # Randomized delay between overwrite passes / before delete to appear more human
+                $sleep = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
+                if ($sleep -gt 0) { Wait-WithProgress -Seconds $sleep -Activity 'Pause before delete' -Status 'Spacing edits and deletes' -NoProgress:$NoProgress }
+
+                # Optional second overwrite pass for a stable-random subset of comments
+                if ($doTwoPass) {
+                    # Try to ensure the second overwrite differs from the first (avoid accidental duplicates)
+                    $overwriteText2 = $null
+                    for ($i = 0; $i -lt 3; $i++) {
+                        $candidate = Get-OverwriteText -Mode $OverwriteMode
+                        if ($candidate -ne $overwriteText) { $overwriteText2 = $candidate; break }
+                    }
+                    if (-not $overwriteText2) { $overwriteText2 = Get-OverwriteText -Mode $OverwriteMode }
+
+                    if (-not $DryRun) {
+                        try {
+                            $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
+                            $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body2 -IsWrite -Context $fullname
+                            $summary.edited++
+                            $editStatus = 'edited(2/2)'
+                        }
+                        catch {
+                            $errorMessage = ($errorMessage ? ($errorMessage + ' | ') : '') + "Second edit failed: $($_.Exception.Message)"
+                            Write-Warning "$fullname second edit failed: $($_.Exception.Message)"
+                            $summary.failures++
+                            $editStatus = 'edited(1/2)+fail(2/2)'
+                        }
+                    }
+                    else {
+                        $editStatus = 'dry-run(2/2)'
+                    }
+
+                    $sleep2 = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
+                    if ($sleep2 -gt 0) { Wait-WithProgress -Seconds $sleep2 -Activity 'Pause before second edit' -Status 'Spacing edits' -NoProgress:$NoProgress }
+                }
+            }
+
+            # Deletion phase: remove comment from Reddit
             if (-not $DryRun) {
                 try {
-                    # Reddit's editusertext endpoint requires thing_id and new text
-                    $body = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText }
-                    $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body -IsWrite -Context $fullname
-                    $summary.edited++
-                    $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
+                    # Reddit's del endpoint requires the thing's full name
+                    $body = @{ api_type = 'json'; id = $fullname }
+                    $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/del') -Body $body -IsWrite -Context $fullname
+                    $summary.deleted++
+                    $deleteStatus = 'deleted'
                 }
                 catch {
-                    # Continue to delete even if edit fails (e.g., archived/locked comments)
-                    $errorMessage = "Edit failed: $($_.Exception.Message)"
-                    Write-Warning "$fullname edit failed: $errorMessage"
+                    $errorMessage = "Delete failed: $($_.Exception.Message)"
+                    Write-Warning "$fullname delete failed: $errorMessage"
                     $summary.failures++
                 }
             }
             else {
-                # Dry-run mode: simulate without actual API calls
-                $editStatus = $doTwoPass ? 'dry-run(1/2)' : 'dry-run'
+                # Dry-run mode: log action without executing
+                $deleteStatus = 'dry-run'
             }
 
-            # Randomized delay between overwrite passes / before delete to appear more human
-            $sleep = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
-            if ($sleep -gt 0) { Wait-WithProgress -Seconds $sleep -Activity 'Pause before delete' -Status 'Spacing edits and deletes' -NoProgress:$NoProgress }
+            # Record this comment's processing result in CSV report
+            Add-ReportRow ([PSCustomObject]@{
+                    created_utc = $createdUtc.ToString('u')
+                    permalink   = ConvertTo-SafeCsvCell -Value $permalink
+                    subreddit   = ConvertTo-SafeCsvCell -Value ([string]$subreddit)
+                    fullname    = ConvertTo-SafeCsvCell -Value $fullname
+                    action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
+                    status      = ConvertTo-SafeCsvCell -Value "$editStatus/$deleteStatus"
+                    error       = ConvertTo-SafeCsvCell -Value $errorMessage
+                })
 
-            # Optional second overwrite pass for a stable-random subset of comments
-            if ($doTwoPass) {
-                # Try to ensure the second overwrite differs from the first (avoid accidental duplicates)
-                $overwriteText2 = $null
-                for ($i = 0; $i -lt 3; $i++) {
-                    $candidate = Get-OverwriteText -Mode $OverwriteMode
-                    if ($candidate -ne $overwriteText) { $overwriteText2 = $candidate; break }
+            # Determine whether to mark as processed (skip if retry requested on failures)
+            $shouldRetry = ($RetryFailures -and -not $DryRun -and $deleteStatus -ne 'deleted')
+
+            if (-not $shouldRetry -and $processedSet.Add($fullname)) {
+                Add-ProcessedIds -Ids @($fullname)
+
+                $processedCount++
+                $displaySub = $subredditNormalized
+                if ([string]::IsNullOrWhiteSpace([string]$displaySub)) {
+                    $displaySub = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
                 }
-                if (-not $overwriteText2) { $overwriteText2 = Get-OverwriteText -Mode $OverwriteMode }
+                if ([string]::IsNullOrWhiteSpace([string]$displaySub)) { $displaySub = 'unknown' }
 
-                if (-not $DryRun) {
-                    try {
-                        $body2 = @{ api_type = 'json'; thing_id = $fullname; text = $overwriteText2 }
-                        $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/editusertext') -Body $body2 -IsWrite -Context $fullname
-                        $summary.edited++
-                        $editStatus = 'edited(2/2)'
+                $createdDate = $createdUtc.ToString('yyyy-MM-dd')
+                Write-Host ("{0} - r/{1} - {2} - {3}" -f $processedCount, $displaySub, $threadTitle, $createdDate) -ForegroundColor DarkGray
+            }
+            elseif ($shouldRetry -and $VerboseLogging) {
+                Write-Verbose "RetryFailures enabled; not marking $fullname as processed because delete did not succeed."
+            }
+
+            $batchCount++
+
+            # Delay between items to avoid rate limiting and appear less bot-like
+            $sleepBetween = Get-RandomDelay -MinSeconds $BetweenItemsDelayMin -MaxSeconds $BetweenItemsDelayMax
+
+            # Enforce minimum 2-second delay for write operations (Reddit best practice)
+            if ($sleepBetween -lt 2 -and $didWrite) { $sleepBetween = 2 }
+            if ($sleepBetween -gt 0) { Wait-WithProgress -Seconds $sleepBetween -Activity 'Between items cooldown' -Status 'Spacing requests' -NoProgress:$NoProgress }
+
+            # Batch cooldown: pause after processing BatchSize items to stay well under rate limits
+            if ($batchCount -ge $BatchSize) {
+                $batchCooldownSeconds = Get-RandomDelay -MinSeconds ($BatchCooldownMinutesMin * 60) -MaxSeconds ($BatchCooldownMinutesMax * 60)
+                $batchCooldownMinutes = [Math]::Round($batchCooldownSeconds / 60.0, 2)
+                Write-Host ("Batch of {0} completed; cooling down for {1} seconds (~{2} minutes)" -f $batchCount, $batchCooldownSeconds, $batchCooldownMinutes) -ForegroundColor Yellow
+                Wait-WithProgress -Seconds $batchCooldownSeconds -Activity 'Batch cooldown' -Status ("Pausing after {0} items" -f $batchCount) -NoProgress:$NoProgress
+                $batchCount = 0
+            }
+
+        }
+
+        # Extract next page token from Reddit's response for pagination
+        $after = $data.data.after
+
+        $stopPaging = $false
+        if ($pastCutoffZone -and $pageOlderTotal -gt 0) {
+            if ($pageOlderUnprocessed -eq 0) {
+                $stopPaging = $true
+                if ($VerboseLogging) { Write-Verbose "Stopping: past cutoff and page older items already processed (total=$pageOlderTotal)." }
+            }
+            elseif ($EnableMostlyProcessedStop) {
+                $ratio = $pageOlderUnprocessed / [double]$pageOlderTotal
+                if ($pageOlderUnprocessed -le $MostlyProcessedMaxUnprocessedPerPage -and $ratio -le $MostlyProcessedRatioThreshold) {
+                    $consecutiveMostlyProcessedPages++
+                    if ($VerboseLogging) {
+                        Write-Verbose ("Mostly-processed page {0}/{1} (older total={2}, unprocessed={3}, ratio={4:P2})" -f $consecutiveMostlyProcessedPages, $MostlyProcessedConsecutivePages, $pageOlderTotal, $pageOlderUnprocessed, $ratio)
                     }
-                    catch {
-                        $errorMessage = ($errorMessage ? ($errorMessage + ' | ') : '') + "Second edit failed: $($_.Exception.Message)"
-                        Write-Warning "$fullname second edit failed: $($_.Exception.Message)"
-                        $summary.failures++
-                        $editStatus = 'edited(1/2)+fail(2/2)'
+                    if ($consecutiveMostlyProcessedPages -ge $MostlyProcessedConsecutivePages) {
+                        $stopPaging = $true
                     }
                 }
                 else {
-                    $editStatus = 'dry-run(2/2)'
-                }
-
-                $sleep2 = Get-RandomDelay -MinSeconds $EditDelaySecondsMin -MaxSeconds $EditDelaySecondsMax
-                if ($sleep2 -gt 0) { Wait-WithProgress -Seconds $sleep2 -Activity 'Pause before second edit' -Status 'Spacing edits' -NoProgress:$NoProgress }
-            }
-        }
-
-        # Deletion phase: remove comment from Reddit
-        if (-not $DryRun) {
-            try {
-                # Reddit's del endpoint requires the thing's full name
-                $body = @{ api_type = 'json'; id = $fullname }
-                $null = Invoke-RedditRequest -Method Post -Uri (Build-RedditUri -Path '/api/del') -Body $body -IsWrite -Context $fullname
-                $summary.deleted++
-                $deleteStatus = 'deleted'
-            }
-            catch {
-                $errorMessage = "Delete failed: $($_.Exception.Message)"
-                Write-Warning "$fullname delete failed: $errorMessage"
-                $summary.failures++
-            }
-        }
-        else {
-            # Dry-run mode: log action without executing
-            $deleteStatus = 'dry-run'
-        }
-
-        # Record this comment's processing result in CSV report
-        Add-ReportRow ([PSCustomObject]@{
-                created_utc = $createdUtc.ToString('u')
-                permalink   = ConvertTo-SafeCsvCell -Value $permalink
-                subreddit   = ConvertTo-SafeCsvCell -Value ([string]$subreddit)
-                fullname    = ConvertTo-SafeCsvCell -Value $fullname
-                action      = $OverwriteEnabled ? ($doTwoPass ? '2xedit+delete' : 'edit+delete') : 'delete'
-                status      = ConvertTo-SafeCsvCell -Value "$editStatus/$deleteStatus"
-                error       = ConvertTo-SafeCsvCell -Value $errorMessage
-            })
-
-        # Mark as processed to avoid reprocessing on resume
-        if ($processedSet.Add($fullname)) {
-            Add-ProcessedIds -Ids @($fullname)
-
-            $processedCount++
-            $displaySub = $subredditNormalized
-            if ([string]::IsNullOrWhiteSpace([string]$displaySub)) {
-                $displaySub = ConvertTo-NormalizedSubredditName -Name ([string]$subreddit)
-            }
-            if ([string]::IsNullOrWhiteSpace([string]$displaySub)) { $displaySub = 'unknown' }
-
-            $createdDate = $createdUtc.ToString('yyyy-MM-dd')
-            Write-Host ("{0} - r/{1} - {2} - {3}" -f $processedCount, $displaySub, $threadTitle, $createdDate) -ForegroundColor DarkGray
-        }
-        $batchCount++
-
-        # Delay between items to avoid rate limiting and appear less bot-like
-        $sleepBetween = Get-RandomDelay -MinSeconds $BetweenItemsDelayMin -MaxSeconds $BetweenItemsDelayMax
-
-        # Enforce minimum 2-second delay for write operations (Reddit best practice)
-        if ($sleepBetween -lt 2 -and $didWrite) { $sleepBetween = 2 }
-        if ($sleepBetween -gt 0) { Wait-WithProgress -Seconds $sleepBetween -Activity 'Between items cooldown' -Status 'Spacing requests' -NoProgress:$NoProgress }
-
-        # Batch cooldown: pause after processing BatchSize items to stay well under rate limits
-        if ($batchCount -ge $BatchSize) {
-            $batchCooldownSeconds = Get-RandomDelay -MinSeconds ($BatchCooldownMinutesMin * 60) -MaxSeconds ($BatchCooldownMinutesMax * 60)
-            $batchCooldownMinutes = [Math]::Round($batchCooldownSeconds / 60.0, 2)
-            Write-Host ("Batch of {0} completed; cooling down for {1} seconds (~{2} minutes)" -f $batchCount, $batchCooldownSeconds, $batchCooldownMinutes) -ForegroundColor Yellow
-            Wait-WithProgress -Seconds $batchCooldownSeconds -Activity 'Batch cooldown' -Status ("Pausing after {0} items" -f $batchCount) -NoProgress:$NoProgress
-            $batchCount = 0
-        }
-
-    }
-
-    # Extract next page token from Reddit's response for pagination
-    $after = $data.data.after
-
-    $stopPaging = $false
-    if ($pastCutoffZone -and $pageOlderTotal -gt 0) {
-        if ($pageOlderUnprocessed -eq 0) {
-            $stopPaging = $true
-            if ($VerboseLogging) { Write-Verbose "Stopping: past cutoff and page older items already processed (total=$pageOlderTotal)." }
-        }
-        elseif ($EnableMostlyProcessedStop) {
-            $ratio = $pageOlderUnprocessed / [double]$pageOlderTotal
-            if ($pageOlderUnprocessed -le $MostlyProcessedMaxUnprocessedPerPage -and $ratio -le $MostlyProcessedRatioThreshold) {
-                $consecutiveMostlyProcessedPages++
-                if ($VerboseLogging) {
-                    Write-Verbose ("Mostly-processed page {0}/{1} (older total={2}, unprocessed={3}, ratio={4:P2})" -f $consecutiveMostlyProcessedPages, $MostlyProcessedConsecutivePages, $pageOlderTotal, $pageOlderUnprocessed, $ratio)
-                }
-                if ($consecutiveMostlyProcessedPages -ge $MostlyProcessedConsecutivePages) {
-                    $stopPaging = $true
+                    $consecutiveMostlyProcessedPages = 0
                 }
             }
             else {
@@ -1710,24 +1748,40 @@ while ($true) {
         else {
             $consecutiveMostlyProcessedPages = 0
         }
+
+        # Save checkpoint at page boundary using next-page cursor (include pass for resume)
+        Save-Checkpoint -State ([PSCustomObject]@{ pass = $pass; after = $after })
+
+        if ($stopPaging) { break }
+
+        # If no 'after' token, we've reached the end of the listing
+        if (-not $after) { break }
     }
-    else {
-        $consecutiveMostlyProcessedPages = 0
+
+    # Aggregate per-pass stats into overall totals
+    $overallSummary.scanned += $summary.scanned
+    $overallSummary.matched += $summary.matched
+    $overallSummary.edited += $summary.edited
+    $overallSummary.deleted += $summary.deleted
+    $overallSummary.failures += $summary.failures
+
+    # Final checkpoint for this pass: reset cursor and advance pass counter for the next run
+    Save-Checkpoint -State ([PSCustomObject]@{ pass = ($pass + 1); after = $null })
+
+    Write-Host "Pass $pass complete. Scanned: $($summary.scanned) | Matched: $($summary.matched) | Edited: $($summary.edited) | Deleted: $($summary.deleted) | Failures: $($summary.failures)" -ForegroundColor Cyan
+
+    if ($summary.matched -eq 0) {
+        Write-Host "No more eligible comments to delete (age + exclusions)." -ForegroundColor Green
+        break
     }
 
-    # Save checkpoint at page boundary using next-page cursor
-    Save-Checkpoint -State ([PSCustomObject]@{ after = $after })
-
-    if ($stopPaging) { break }
-
-    # If no 'after' token, we've reached the end of the listing
-    if (-not $after) { break }
+    if ($pass -ge $MaxPasses) {
+        Write-Warning "Reached MaxPasses ($MaxPasses); stopping to avoid infinite looping."
+        break
+    }
 }
 
-# Final checkpoint save with complete processed list
-Save-Checkpoint -State ([PSCustomObject]@{ after = $after })
-
 Write-Host "Scan complete." -ForegroundColor Cyan
-Write-Host "Scanned: $($summary.scanned) | Matched: $($summary.matched) | Edited: $($summary.edited) | Deleted: $($summary.deleted) | Failures: $($summary.failures)" -ForegroundColor Green
+Write-Host "Scanned: $($overallSummary.scanned) | Matched: $($overallSummary.matched) | Edited: $($overallSummary.edited) | Deleted: $($overallSummary.deleted) | Failures: $($overallSummary.failures)" -ForegroundColor Green
 Write-Host "Report saved to $ReportPath" -ForegroundColor Green
 Write-Host "Checkpoint saved to $ResumePath" -ForegroundColor Green

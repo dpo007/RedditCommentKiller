@@ -191,7 +191,17 @@ Delete state files to start fresh.
 
 ---
 
-## 10) Scope and limits
+## 10) Multi-pass mode and Reddit’s ~1k listing cap
+
+- Reddit’s `/user/{name}/comments` listing only exposes roughly the newest 1,000 comments via pagination. If you have more history, older comments may be unreachable in a single pass.
+- The script loops multiple passes (default up to `-MaxPasses 10`) from newest → oldest until a pass finds **no eligible comments** (older-than-cutoff, not excluded, not already processed). Then it stops and prints “No more eligible comments to delete (age + exclusions).”
+- Checkpoint/resume stores the pass number and pagination cursor so you can resume mid-pass safely; each new pass restarts from the newest comments.
+- Excluded subreddits and newer-than-cutoff comments are intentionally left; they still occupy slots in the newest ~1k window, so heavy exclusions or a lot of recent comments can prevent very old comments from ever becoming reachable.
+- Opt-in retries: use `-RetryFailures` to avoid marking failed deletes as processed so they are retried on later passes. (Default behavior marks failures processed to avoid looping.)
+
+---
+
+## 11) Scope and limits
 
 - ✅ Your comments
 - ❌ Posts
