@@ -74,28 +74,18 @@ These steps use **Microsoft Edge**, but the process is similar in other Chromium
    - In DevTools, click **Network**
    - If the Network tab is empty, refresh the page (**Ctrl+R**) while DevTools is open
 
-4. **Filter for API requests**
-   - In the filter box, type:
+4. **Search for token**
+   - In the Search box, type:
      ```
-     me
+     Bearer
      ```
-   - Look for a request similar to:
+   - Look for a result similar to:
      ```
-     https://oauth.reddit.com/api/v1/me
-     ```
-
-5. **Inspect the request**
-   - Click the `/api/v1/me` request
-   - In the right-hand pane, select the **Headers** tab
-
-6. **Locate the Authorization header**
-   - Scroll down to **Request Headers**
-   - Find:
-     ```
-     Authorization: Bearer <LONG_TOKEN_VALUE>
+     Authorization
+     Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6... (it'll be long)
      ```
 
-7. **Copy the token**
+5. **Copy the token**
    - Copy **only** the value *after* `Bearer `
    - Do **not** include the word `Bearer`
 
