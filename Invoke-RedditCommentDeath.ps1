@@ -125,6 +125,10 @@ param(
     [ValidateRange(1, 100)]
     [int]$MaxPasses = 10,
 
+    # Pagination safety rail: stop a pass after this many pages to avoid infinite loops/repeat cursors.
+    [ValidateRange(1, 5000)]
+    [int]$MaxPagesPerPass = 500,
+
     [switch]$SkipOverwrite,
 
     # Optional stop optimization: end pagination once pages beyond cutoff are mostly already processed.
@@ -1108,7 +1112,43 @@ function Get-CommentsPage {
 
     $targetUser = $Script:AuthenticatedUsername
     $uri = Build-RedditUri -Path "/user/$targetUser/comments"
-    Invoke-RedditRequest -Method Get -Uri $uri -Query $query
+
+    # Build a stable display URI for logging.
+    $displayUri = $uri
+    try {
+        $pairs = foreach ($entry in $query.GetEnumerator()) {
+            $k = [string]$entry.Key
+            if ([string]::IsNullOrWhiteSpace($k)) { continue }
+
+            $v = $entry.Value
+            if ($null -eq $v) { continue }
+
+            $kEsc = [uri]::EscapeDataString($k)
+            $vEsc = [uri]::EscapeDataString([string]$v)
+            "{0}={1}" -f $kEsc, $vEsc
+        }
+
+        $qs = ($pairs -join '&')
+        if ($qs) { $displayUri = "$uri?$qs" }
+    }
+    catch {
+        $displayUri = $uri
+    }
+
+    $result = Invoke-RedditRequest -Method Get -Uri $uri -Query $query -Context "GET $displayUri"
+
+    $count = 0
+    try {
+        if ($result -and $result.Data -and $result.Data.data -and $result.Data.data.children) {
+            $count = @($result.Data.data.children).Count
+        }
+    }
+    catch {
+        $count = 0
+    }
+
+    Write-Host "Retrieved $count comments from $displayUri" -ForegroundColor DarkCyan
+    return $result
 }
 
 function Save-Checkpoint {
@@ -1246,6 +1286,12 @@ function Initialize-Report {
     # Skip if report already exists (allows appending to existing reports)
     if (Test-Path $ReportPath) { return }
 
+    # Ensure the report directory exists for custom paths
+    $reportDir = Split-Path -Parent $ReportPath
+    if ($reportDir -and -not (Test-Path $reportDir)) {
+        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    }
+
     # Create CSV with column headers
     [PSCustomObject]@{ created_utc = ''; permalink = ''; subreddit = ''; fullname = ''; action = ''; status = ''; error = '' } | Export-Csv -Path $ReportPath -NoTypeInformation
 }
@@ -1290,6 +1336,40 @@ function ConvertTo-SingleLineText {
         return $t.Substring(0, $MaxLength - 1) + '…'
     }
     return $t
+}
+
+function Update-OldestSeenInfo {
+    <#
+    .SYNOPSIS
+    Tracks the oldest created_utc encountered in the listing along with context.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [DateTime]$CreatedUtc,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Fullname,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Subreddit,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Slot
+    )
+
+    if (-not $CreatedUtc) { return }
+
+    if (-not $Slot.Value -or $CreatedUtc -lt $Slot.Value.createdUtc) {
+        $Slot.Value = [PSCustomObject]@{
+            createdUtc = $CreatedUtc
+            fullname   = $Fullname
+            subreddit  = $Subreddit
+            reason     = $Reason
+        }
+    }
 }
 
 function Get-ThreadTitleFromPermalink {
@@ -1438,6 +1518,8 @@ Write-Host "Authenticated as /u/$($Script:AuthenticatedUsername)" -ForegroundCol
 
 # Track processing statistics across all passes (aggregated)
 $overallSummary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
+$overallOldestSeenInfo = $null
+$overallEnteredCutoffZone = $false
 
 # Determine starting pass (allows resume mid-pass)
 $startPass = 1
@@ -1467,12 +1549,23 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
     }
 
     $summary = [PSCustomObject]@{ scanned = 0; matched = 0; edited = 0; deleted = 0; failures = 0 }
+    $pagesFetched = 0
+    $seenAfterTokens = [System.Collections.Generic.HashSet[string]]::new()
+    $oldestSeenInfo = $null
+    $enteredCutoffZone = $false
+    $stopReason = $null
     $batchCount = 0
     $consecutiveMostlyProcessedPages = 0
     $pastCutoffZone = $false
 
     # Resume mid-pass if checkpoint has a cursor for this pass; otherwise restart from newest.
     $after = if ($pass -eq $startPass) { $state.after } else { $null }
+
+    $recordOldestSeen = {
+        param($createdUtc, $fullname, $subreddit, $reason)
+        Update-OldestSeenInfo -CreatedUtc $createdUtc -Fullname $fullname -Subreddit $subreddit -Reason $reason -Slot ([ref]$oldestSeenInfo)
+        Update-OldestSeenInfo -CreatedUtc $createdUtc -Fullname $fullname -Subreddit $subreddit -Reason $reason -Slot ([ref]$overallOldestSeenInfo)
+    }
 
     Write-Host "-- Pass $pass / $MaxPasses --" -ForegroundColor Cyan
 
@@ -1487,6 +1580,8 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
 
         $children = $data.data.children
         if (-not $children) { break }
+
+        $pagesFetched++
 
         $pageOlderTotal = 0
         $pageOlderUnprocessed = 0
@@ -1544,8 +1639,15 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
                 $threadTitle = '(unknown thread)'
             }
 
+            $isOlderThanCutoff = $createdUtc -le $effectiveCutoffUtc
+
+            if ($isOlderThanCutoff -and -not $enteredCutoffZone) { $enteredCutoffZone = $true }
+
             # Safety rule: never process anything newer than the cutoff, even if Reddit returns out-of-order items.
-            if ($createdUtc -gt $effectiveCutoffUtc) { continue }
+            if (-not $isOlderThanCutoff) {
+                & $recordOldestSeen $createdUtc $fullname $subredditNormalized "newer than cutoff (-DaysOld=$DaysOld)"
+                continue
+            }
 
             # Listing is typically newest -> oldest. Once we see the first older-than-cutoff item, we are in the cutoff zone.
             if (-not $pastCutoffZone) { $pastCutoffZone = $true }
@@ -1553,6 +1655,7 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
             # Optional exclusion: skip comments in excluded subreddits before accounting for paging stop logic.
             if ($excludedSubredditsSet.Count -gt 0 -and $subredditNormalized -and $excludedSubredditsSet.Contains($subredditNormalized)) {
                 if ($VerboseLogging) { Write-Verbose "Skipping $fullname in excluded subreddit r/$subredditNormalized" }
+                & $recordOldestSeen $createdUtc $fullname $subredditNormalized "excluded subreddit r/$subredditNormalized"
                 continue
             }
 
@@ -1560,7 +1663,10 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
             if ($pastCutoffZone) { $pageOlderTotal++ }
 
             # Skip if already processed in previous run (resume functionality)
-            if ($processedSet.Contains($fullname)) { continue }
+            if ($processedSet.Contains($fullname)) {
+                & $recordOldestSeen $createdUtc $fullname $subredditNormalized 'already processed (resume log)'
+                continue
+            }
 
             if ($pastCutoffZone) { $pageOlderUnprocessed++ }
 
@@ -1568,7 +1674,10 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
             $actionDesc = "comment $fullname"
 
             # Honor -WhatIf parameter (CmdletBinding SupportsShouldProcess)
-            if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) { continue }
+            if (-not $PSCmdlet.ShouldProcess($actionDesc, 'Process')) {
+                & $recordOldestSeen $createdUtc $fullname $subredditNormalized 'skipped by ShouldProcess/WhatIf'
+                continue
+            }
 
             # Initialize tracking variables for this comment's processing
             $overwriteText = $null
@@ -1680,6 +1789,8 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
                     error       = ConvertTo-SafeCsvCell -Value $errorMessage
                 })
 
+            & $recordOldestSeen $createdUtc $fullname $subredditNormalized 'processed'
+
             # Determine whether to mark as processed (skip if retry requested on failures)
             $shouldRetry = ($RetryFailures -and -not $DryRun -and $deleteStatus -ne 'deleted')
 
@@ -1723,15 +1834,34 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
         # Extract next page token from Reddit's response for pagination
         $after = $data.data.after
 
-        $stopPaging = $false
-        if ($pastCutoffZone -and $pageOlderTotal -gt 0) {
-            if ($pageOlderUnprocessed -eq 0) {
-                $stopPaging = $true
-                if ($VerboseLogging) { Write-Verbose "Stopping: past cutoff and page older items already processed (total=$pageOlderTotal)." }
+        if (-not $stopReason -and $pagesFetched -ge $MaxPagesPerPass) {
+            $stopReason = "Reached MaxPagesPerPass ($MaxPagesPerPass) without hitting cutoff"
+        }
+
+        if (-not $stopReason -and $after) {
+            if (-not $seenAfterTokens.Add($after)) {
+                $stopReason = "Repeated after token '$after' detected; stopping to avoid loop"
             }
-            elseif ($EnableMostlyProcessedStop) {
+        }
+
+        if (-not $stopReason -and -not $enteredCutoffZone -and $pageOlderTotal -eq 0 -and -not $after) {
+            $stopReason = "Listing depth exhausted before reaching cutoff (all pages newer than -$DaysOld days)"
+        }
+
+        $stopPaging = $false
+        if ($EnableMostlyProcessedStop -and $pastCutoffZone -and $pageOlderTotal -gt 0) {
+            if ($pageOlderUnprocessed -eq 0) {
+                $consecutiveMostlyProcessedPages++
+                if ($VerboseLogging) {
+                    Write-Verbose ("Mostly-processed page {0}/{1} (older total={2}, unprocessed={3}, ratio=n/a)" -f $consecutiveMostlyProcessedPages, $MostlyProcessedConsecutivePages, $pageOlderTotal, $pageOlderUnprocessed)
+                }
+                if ($consecutiveMostlyProcessedPages -ge $MostlyProcessedConsecutivePages) {
+                    $stopPaging = $true
+                }
+            }
+            elseif ($pageOlderUnprocessed -le $MostlyProcessedMaxUnprocessedPerPage) {
                 $ratio = $pageOlderUnprocessed / [double]$pageOlderTotal
-                if ($pageOlderUnprocessed -le $MostlyProcessedMaxUnprocessedPerPage -and $ratio -le $MostlyProcessedRatioThreshold) {
+                if ($ratio -le $MostlyProcessedRatioThreshold) {
                     $consecutiveMostlyProcessedPages++
                     if ($VerboseLogging) {
                         Write-Verbose ("Mostly-processed page {0}/{1} (older total={2}, unprocessed={3}, ratio={4:P2})" -f $consecutiveMostlyProcessedPages, $MostlyProcessedConsecutivePages, $pageOlderTotal, $pageOlderUnprocessed, $ratio)
@@ -1752,6 +1882,17 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
             $consecutiveMostlyProcessedPages = 0
         }
 
+        if ($stopReason) {
+            $stopPaging = $true
+            $oldestStampText = 'n/a'
+            $reasonText = ''
+            if ($oldestSeenInfo) {
+                $oldestStampText = $oldestSeenInfo.createdUtc.ToString('u')
+                if ($oldestSeenInfo.reason) { $reasonText = " Reason: $($oldestSeenInfo.reason)." }
+            }
+            Write-Warning "$stopReason. Oldest created_utc seen this pass: $oldestStampText (UTC).$reasonText Reddit may be limiting listings to the newest ~1000 items. Consider reducing -DaysOld or rerunning later."
+        }
+
         # Save checkpoint at page boundary using next-page cursor (include pass for resume)
         if (-not $DryRun) {
             Save-Checkpoint -State ([PSCustomObject]@{ pass = $pass; after = $after })
@@ -1765,6 +1906,8 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
         # If no 'after' token, we've reached the end of the listing
         if (-not $after) { break }
     }
+
+    if ($enteredCutoffZone) { $overallEnteredCutoffZone = $true }
 
     # Aggregate per-pass stats into overall totals
     $overallSummary.scanned += $summary.scanned
@@ -1783,6 +1926,24 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
 
     Write-Host "Pass $pass complete. Scanned: $($summary.scanned) | Matched: $($summary.matched) | Edited: $($summary.edited) | Deleted: $($summary.deleted) | Failures: $($summary.failures)" -ForegroundColor Cyan
 
+    if ($oldestSeenInfo) {
+        $reasonText = $oldestSeenInfo.reason ? " [reason: $($oldestSeenInfo.reason)]" : ''
+        Write-Host ("Oldest created_utc seen this pass: {0} (UTC){1}" -f $oldestSeenInfo.createdUtc.ToString('u'), $reasonText) -ForegroundColor DarkCyan
+    }
+    elseif ($VerboseLogging) {
+        Write-Verbose "No comments with a valid created_utc were seen this pass."
+    }
+
+    if (-not $enteredCutoffZone) {
+        $oldestStampText = 'n/a'
+        $reasonText = ''
+        if ($oldestSeenInfo) {
+            $oldestStampText = $oldestSeenInfo.createdUtc.ToString('u')
+            if ($oldestSeenInfo.reason) { $reasonText = " Reason: $($oldestSeenInfo.reason)." }
+        }
+        Write-Warning "Did not reach the -DaysOld cutoff this pass; listing may be capped to the newest ~1000 comments. Oldest created_utc seen: $oldestStampText (UTC).$reasonText Consider reducing -DaysOld or rerunning later."
+    }
+
     if ($summary.matched -eq 0) {
         Write-Host "No more eligible comments to delete (age + exclusions)." -ForegroundColor Green
         break
@@ -1796,6 +1957,22 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
 
 Write-Host "Scan complete." -ForegroundColor Cyan
 Write-Host "Scanned: $($overallSummary.scanned) | Matched: $($overallSummary.matched) | Edited: $($overallSummary.edited) | Deleted: $($overallSummary.deleted) | Failures: $($overallSummary.failures)" -ForegroundColor Green
+if ($overallOldestSeenInfo) {
+    $reasonText = $overallOldestSeenInfo.reason ? " [reason: $($overallOldestSeenInfo.reason)]" : ''
+    Write-Host ("Oldest created_utc seen across all passes: {0} (UTC){1}" -f $overallOldestSeenInfo.createdUtc.ToString('u'), $reasonText) -ForegroundColor DarkCyan
+}
+elseif ($VerboseLogging) {
+    Write-Verbose "No comments with a valid created_utc were seen across all passes."
+}
+if (-not $overallEnteredCutoffZone) {
+    $oldestStampText = 'n/a'
+    $reasonText = ''
+    if ($overallOldestSeenInfo) {
+        $oldestStampText = $overallOldestSeenInfo.createdUtc.ToString('u')
+        if ($overallOldestSeenInfo.reason) { $reasonText = " Reason: $($overallOldestSeenInfo.reason)." }
+    }
+    Write-Warning "Never reached the -DaysOld cutoff in any pass; Reddit likely limited listings to the newest ~1000 comments. Oldest created_utc seen: $oldestStampText (UTC).$reasonText Consider reducing -DaysOld or rerunning later."
+}
 Write-Host "Report saved to $ReportPath" -ForegroundColor Green
 if (-not $DryRun) {
     Write-Host "Checkpoint saved to $ResumePath" -ForegroundColor Green
