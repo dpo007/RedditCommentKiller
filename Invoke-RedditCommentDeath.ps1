@@ -80,6 +80,12 @@ List actions without performing edits or deletes.
 .PARAMETER VerboseLogging
 Emit extra diagnostic output.
 
+.PARAMETER AuthFailureRetries
+Number of retries to attempt when authentication fails (HTTP 401/403). Default is 2 (3 total tries).
+
+.PARAMETER AuthFailureRetryDelaySeconds
+Seconds to wait between authentication-failure retries.
+
 .EXAMPLE
 ./Invoke-RedditCommentDeath.ps1 -SessionAccessToken (Read-Host "Session token" -AsSecureString) -DaysOld 90
 
@@ -168,6 +174,13 @@ param(
 
     # Retry items that fail (edit/delete) instead of marking them processed (opt-in)
     [switch]$RetryFailures,
+
+    # Authentication failure policy: retry a couple times, then stop.
+    [ValidateRange(0, 10)]
+    [int]$AuthFailureRetries = 2,
+
+    [ValidateRange(0, 600)]
+    [int]$AuthFailureRetryDelaySeconds = 3,
 
     # Checkpoint state file (cursor) so runs can resume.
     [string]$ResumePath = './reddit_cleanup_state.json',
@@ -529,58 +542,9 @@ function Confirm-AuthenticatedIdentity {
 
     if (-not [string]::IsNullOrWhiteSpace($Script:AuthenticatedUsername)) { return }
 
-    Confirm-AuthIsReady
-    $headers = Get-AuthHeadersFromProvider
     $meUri = Build-RedditUri -Path '/api/v1/me'
-
-    $refreshed = $false
-    try {
-        $resp = Invoke-WebRequest -Method Get -Uri $meUri -Headers $headers -ErrorAction Stop
-    }
-    catch {
-        $status = $null
-        try {
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                $status = [int]$_.Exception.Response.StatusCode
-            }
-        }
-        catch { $status = $null }
-
-        if (($status -eq 401 -or $status -eq 403) -and -not $refreshed) {
-            $refreshed = Invoke-AuthRefreshOnce
-            if ($refreshed) {
-                Confirm-AuthIsReady
-                $headers = Get-AuthHeadersFromProvider
-                $resp = Invoke-WebRequest -Method Get -Uri $meUri -Headers $headers -ErrorAction Stop
-            }
-            else {
-                throw "Authentication failed for /api/v1/me (status $status). Provider could not refresh; stop to avoid acting unauthenticated."
-            }
-        }
-        else {
-            throw
-        }
-    }
-
-    $rawContent = $resp.Content
-    if ([string]::IsNullOrWhiteSpace([string]$rawContent)) {
-        throw 'Unable to verify authenticated user via /api/v1/me (empty response body).'
-    }
-    if (Test-IsHtmlContent -Content $rawContent) {
-        throw 'Unexpected HTML response from Reddit /api/v1/me (possible auth/rate-limit/protection page).'
-    }
-
-    $me = $null
-    try {
-        $me = $rawContent | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        $snippetLength = [Math]::Min([int]$rawContent.Length, 500)
-        $snippet = $rawContent.Substring(0, $snippetLength)
-        $snippet = $snippet -replace "`r", '' -replace "`n", ' '
-        $parseMsg = $_.Exception.Message
-        throw "Unable to verify authenticated user via /api/v1/me (JSON parse failed). $parseMsg Snippet: $snippet"
-    }
+    $result = Invoke-RedditRequest -Method Get -Uri $meUri -Context '/api/v1/me'
+    $me = $result.Data
 
     $name = $null
     if ($null -ne $me -and $me.PSObject.Properties.Match('name').Count -gt 0) {
@@ -754,7 +718,14 @@ function Invoke-RedditRequest {
     $maxAttempts = 5
     $attempt = 0
     $backoff = 2  # Initial backoff in seconds, doubles on each retry
-    $refreshedOnAuthFailure = $false
+
+    # Authentication failure policy: allow a few tries, then stop.
+    $authFailureAttempts = 0
+    $maxAuthFailureAttempts = 1 + [Math]::Max(0, [int]$AuthFailureRetries)
+    $triedAuthRefresh = $false
+
+    # Ensure the main loop allows enough attempts to honor auth retry policy.
+    $maxAttempts = [Math]::Max([int]$maxAttempts, [int]$maxAuthFailureAttempts)
 
     while ($attempt -lt $maxAttempts) {
         $attempt++
@@ -1038,18 +1009,42 @@ function Invoke-RedditRequest {
                 }
             }
 
-            # 401/403: allow one refresh attempt, then stop
-            if (($status -eq 401 -or $status -eq 403) -and -not $refreshedOnAuthFailure -and $attempt -lt $maxAttempts) {
+            $isAuthStatus = ($status -eq 401 -or $status -eq 403)
+            $isHtmlDefense = ($ex -and $ex.Message -like 'Unexpected HTML response from Reddit*')
+
+            # Authentication failures should stop the run after a couple retries.
+            if ($isAuthStatus -or $isHtmlDefense) {
+                $authFailureAttempts++
                 $ctx = ([string]::IsNullOrWhiteSpace($Context)) ? '' : " [$Context]"
-                Write-Warning "API call returned $status$ctx; attempting a single auth refresh."
-                $refreshed = Invoke-AuthRefreshOnce
-                if ($refreshed) {
-                    $refreshedOnAuthFailure = $true
-                    Confirm-AuthIsReady
+
+                if ($isAuthStatus) {
+                    Write-Warning "Authentication failed with status $status$ctx (try $authFailureAttempts of $maxAuthFailureAttempts)."
+                }
+                else {
+                    Write-Warning "Received HTML response$ctx (possible auth/protection page) (try $authFailureAttempts of $maxAuthFailureAttempts)."
+                }
+
+                # Try provider refresh once if supported (session-derived tokens generally cannot refresh).
+                if (-not $triedAuthRefresh) {
+                    $triedAuthRefresh = $true
+                    $refreshed = Invoke-AuthRefreshOnce
+                    if ($refreshed) {
+                        Confirm-AuthIsReady
+                        continue
+                    }
+                }
+
+                if ($authFailureAttempts -lt $maxAuthFailureAttempts) {
+                    $delay = [Math]::Max([int]$AuthFailureRetryDelaySeconds, 0)
+                    if ($delay -gt 0) {
+                        Wait-WithProgress -Seconds $delay -Activity 'Auth failure retry' -Status "Retrying after auth failure ($authFailureAttempts of $maxAuthFailureAttempts)" -NoProgress:$NoProgress
+                    }
                     continue
                 }
 
-                throw "Authentication failed with status $status$ctx and refresh is unsupported/failed. Stopping to avoid unauthenticated actions."
+                $statusPart = $isAuthStatus ? "status $status" : 'unexpected HTML response'
+                $hint = "Session token appears expired/invalid. Refresh your session-derived token and re-run. See UserGuide.md section '3) How to obtain your Reddit session token (Microsoft Edge)'."
+                throw [System.UnauthorizedAccessException]::new("Authentication failed ($statusPart)$ctx after $maxAuthFailureAttempts tries. $hint")
             }
 
             # Retry policy
@@ -1412,8 +1407,13 @@ if ($state.processed -and $state.processed.Count -gt 0) {
     }
 
     if ($toAppend.Count -gt 0) {
-        Add-ProcessedIds -Ids $toAppend.ToArray()
-        Write-Host "Migrated $($toAppend.Count) legacy processed IDs into $ProcessedLogPath" -ForegroundColor Yellow
+        if (-not $DryRun) {
+            Add-ProcessedIds -Ids $toAppend.ToArray()
+            Write-Host "Migrated $($toAppend.Count) legacy processed IDs into $ProcessedLogPath" -ForegroundColor Yellow
+        }
+        elseif ($VerboseLogging) {
+            Write-Verbose "DryRun enabled; skipping migration of legacy processed IDs into $ProcessedLogPath"
+        }
     }
 }
 
@@ -1598,6 +1598,7 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
                         $editStatus = $doTwoPass ? 'edited(1/2)' : 'edited'
                     }
                     catch {
+                        if ($_.Exception -is [System.UnauthorizedAccessException]) { throw }
                         # Continue to delete even if edit fails (e.g., archived/locked comments)
                         $errorMessage = "Edit failed: $($_.Exception.Message)"
                         Write-Warning "$fullname edit failed: $errorMessage"
@@ -1631,6 +1632,7 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
                             $editStatus = 'edited(2/2)'
                         }
                         catch {
+                            if ($_.Exception -is [System.UnauthorizedAccessException]) { throw }
                             $errorMessage = ($errorMessage ? ($errorMessage + ' | ') : '') + "Second edit failed: $($_.Exception.Message)"
                             Write-Warning "$fullname second edit failed: $($_.Exception.Message)"
                             $summary.failures++
@@ -1656,6 +1658,7 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
                     $deleteStatus = 'deleted'
                 }
                 catch {
+                    if ($_.Exception -is [System.UnauthorizedAccessException]) { throw }
                     $errorMessage = "Delete failed: $($_.Exception.Message)"
                     Write-Warning "$fullname delete failed: $errorMessage"
                     $summary.failures++
@@ -1680,7 +1683,7 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
             # Determine whether to mark as processed (skip if retry requested on failures)
             $shouldRetry = ($RetryFailures -and -not $DryRun -and $deleteStatus -ne 'deleted')
 
-            if (-not $shouldRetry -and $processedSet.Add($fullname)) {
+            if (-not $DryRun -and -not $shouldRetry -and $processedSet.Add($fullname)) {
                 Add-ProcessedIds -Ids @($fullname)
 
                 $processedCount++
@@ -1750,7 +1753,12 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
         }
 
         # Save checkpoint at page boundary using next-page cursor (include pass for resume)
-        Save-Checkpoint -State ([PSCustomObject]@{ pass = $pass; after = $after })
+        if (-not $DryRun) {
+            Save-Checkpoint -State ([PSCustomObject]@{ pass = $pass; after = $after })
+        }
+        elseif ($VerboseLogging) {
+            Write-Verbose "DryRun enabled; skipping checkpoint write (pass=$pass, after=$after)"
+        }
 
         if ($stopPaging) { break }
 
@@ -1766,7 +1774,12 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
     $overallSummary.failures += $summary.failures
 
     # Final checkpoint for this pass: reset cursor and advance pass counter for the next run
-    Save-Checkpoint -State ([PSCustomObject]@{ pass = ($pass + 1); after = $null })
+    if (-not $DryRun) {
+        Save-Checkpoint -State ([PSCustomObject]@{ pass = ($pass + 1); after = $null })
+    }
+    elseif ($VerboseLogging) {
+        Write-Verbose "DryRun enabled; skipping end-of-pass checkpoint write (would set next pass to $($pass + 1))"
+    }
 
     Write-Host "Pass $pass complete. Scanned: $($summary.scanned) | Matched: $($summary.matched) | Edited: $($summary.edited) | Deleted: $($summary.deleted) | Failures: $($summary.failures)" -ForegroundColor Cyan
 
@@ -1784,4 +1797,9 @@ for ($pass = $startPass; $pass -le $MaxPasses; $pass++) {
 Write-Host "Scan complete." -ForegroundColor Cyan
 Write-Host "Scanned: $($overallSummary.scanned) | Matched: $($overallSummary.matched) | Edited: $($overallSummary.edited) | Deleted: $($overallSummary.deleted) | Failures: $($overallSummary.failures)" -ForegroundColor Green
 Write-Host "Report saved to $ReportPath" -ForegroundColor Green
-Write-Host "Checkpoint saved to $ResumePath" -ForegroundColor Green
+if (-not $DryRun) {
+    Write-Host "Checkpoint saved to $ResumePath" -ForegroundColor Green
+}
+else {
+    Write-Host "DryRun enabled; checkpoint NOT updated." -ForegroundColor Yellow
+}
