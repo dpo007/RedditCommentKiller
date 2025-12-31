@@ -139,10 +139,10 @@ param(
     [double]$TwoPassProbability = 0.0,
 
     [ValidateRange(1, 86400)]
-    [int]$EditDelaySecondsMin = 10,
+    [int]$EditDelaySecondsMin = 5,
 
     [ValidateRange(1, 86400)]
-    [int]$EditDelaySecondsMax = 30,
+    [int]$EditDelaySecondsMax = 20,
 
     [ValidateRange(1, 86400)]
     [int]$BetweenItemsDelayMin = 2,
