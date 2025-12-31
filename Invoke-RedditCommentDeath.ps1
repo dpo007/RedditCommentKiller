@@ -1650,7 +1650,8 @@ while ($true) {
             }
             if ([string]::IsNullOrWhiteSpace([string]$displaySub)) { $displaySub = 'unknown' }
 
-            Write-Host ("{0} - r/{1} - {2}" -f $processedCount, $displaySub, $threadTitle) -ForegroundColor DarkGray
+            $createdDate = $createdUtc.ToString('yyyy-MM-dd')
+            Write-Host ("{0} - r/{1} - {2} - {3}" -f $processedCount, $displaySub, $threadTitle, $createdDate) -ForegroundColor DarkGray
         }
         $batchCount++
 
